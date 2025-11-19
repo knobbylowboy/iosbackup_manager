@@ -23,6 +23,14 @@ file_analysis.txt
 backup_analysis.txt
 *.log
 
+# Binary tools
+ffmpeg
+ffprobe
+heic-converter
+
+# Test files and attachments
+attachment_files/
+
 # IDE files
 .vscode/
 .idea/

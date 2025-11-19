@@ -74,6 +74,11 @@ func (cd *ContentDetector) initializeSignatures() {
 		{Name: "MP4", Extension: "mp4", MagicBytes: [][]byte{{0x66, 0x74, 0x79, 0x70}}, Offset: 4, Description: "MP4 Video"},
 		{Name: "MOV", Extension: "mov", MagicBytes: [][]byte{{0x66, 0x74, 0x79, 0x70, 0x71, 0x74}}, Offset: 4, Description: "QuickTime MOV Video"},
 		{Name: "AVI", Extension: "avi", MagicBytes: [][]byte{{0x41, 0x56, 0x49, 0x20}}, Offset: 8, Description: "AVI Video"},
+		{Name: "MPG", Extension: "mpg", MagicBytes: [][]byte{{0x00, 0x00, 0x01, 0xba}, {0x00, 0x00, 0x01, 0xb3}, {0x00, 0x00, 0x01, 0xb0}}, Offset: 0, Description: "MPEG Video"},
+		{Name: "WMV", Extension: "wmv", MagicBytes: [][]byte{{0x30, 0x26, 0xB2, 0x75, 0x8E, 0x66, 0xCF, 0x11}}, Offset: 0, Description: "Windows Media Video"},
+		{Name: "FLV", Extension: "flv", MagicBytes: [][]byte{{0x46, 0x4C, 0x56, 0x01}}, Offset: 0, Description: "Flash Video"},
+		{Name: "WebM", Extension: "webm", MagicBytes: [][]byte{{0x1A, 0x45, 0xDF, 0xA3}}, Offset: 0, Description: "WebM Video"},
+		{Name: "MKV", Extension: "mkv", MagicBytes: [][]byte{{0x1A, 0x45, 0xDF, 0xA3}}, Offset: 0, Description: "Matroska Video"},
 		
 		// Audio
 		{Name: "MP3", Extension: "mp3", MagicBytes: [][]byte{{0x49, 0x44, 0x33}, {0xFF, 0xFB}, {0xFF, 0xF3}, {0xFF, 0xF2}}, Offset: 0, Description: "MP3 Audio"},
