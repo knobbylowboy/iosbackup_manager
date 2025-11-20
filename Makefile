@@ -9,6 +9,9 @@ BINARY_NAME=iosbackup_manager
 # Path to macOS Frameworks folder (relative to iosbackup_manager directory)
 MACOS_FRAMEWORKS=../dispute_buddy/macos/Frameworks
 
+# Path to Debug app bundle Frameworks folder
+DEBUG_FRAMEWORKS=/Users/sethbell/Dev/dispute_buddy/build/macos/Build/Products/Debug/Dispute Buddy.app/Contents/Frameworks
+
 # Path to Windows bin folder (relative to iosbackup_manager directory)
 WINDOWS_BIN=../dispute_buddy/windows/bin
 
@@ -18,7 +21,10 @@ build:
 	@echo "Copying $(BINARY_NAME) to $(MACOS_FRAMEWORKS)/"
 	@mkdir -p $(MACOS_FRAMEWORKS)
 	@cp $(BINARY_NAME) $(MACOS_FRAMEWORKS)/$(BINARY_NAME)
-	@echo "Build complete: $(BINARY_NAME) copied to macOS Frameworks"
+	@echo "Copying $(BINARY_NAME) to $(DEBUG_FRAMEWORKS)/"
+	@mkdir -p "$(DEBUG_FRAMEWORKS)"
+	@cp $(BINARY_NAME) "$(DEBUG_FRAMEWORKS)/$(BINARY_NAME)"
+	@echo "Build complete: $(BINARY_NAME) copied to macOS Frameworks and Debug app bundle"
 
 # Install dependencies
 deps:
@@ -75,7 +81,8 @@ clean:
 # Clean build artifacts including macOS Frameworks copy
 clean-all: clean
 	rm -f $(MACOS_FRAMEWORKS)/$(BINARY_NAME)
-	@echo "Removed binary from macOS Frameworks"
+	rm -f "$(DEBUG_FRAMEWORKS)/$(BINARY_NAME)"
+	@echo "Removed binary from macOS Frameworks and Debug app bundle"
 
 # Install the binary to GOPATH/bin
 install: build
@@ -119,4 +126,5 @@ help:
 	@echo "  - Other files (except SQLite) -> deleted permanently"
 	@echo ""
 	@echo "Note: 'make build' automatically copies the binary to:"
-	@echo "  $(MACOS_FRAMEWORKS)/$(BINARY_NAME)" 
+	@echo "  $(MACOS_FRAMEWORKS)/$(BINARY_NAME)"
+	@echo "  $(DEBUG_FRAMEWORKS)/$(BINARY_NAME)" 

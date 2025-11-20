@@ -6,7 +6,7 @@ import (
 	"image"
 	"image/gif"
 	"image/jpeg"
-	"log"
+	"image/png"
 	"os"
 	"os/exec"
 	"path/filepath"
@@ -15,6 +15,7 @@ import (
 	"time"
 
 	"github.com/fsnotify/fsnotify"
+	"golang.org/x/image/webp"
 )
 
 var (
@@ -29,7 +30,9 @@ func getExecutableDir() string {
 		// Check if we're running in a test (test binary name contains "test")
 		execPath, err := os.Executable()
 		if err != nil {
-			log.Printf("Warning: Could not determine executable path: %v", err)
+			if errorLog != nil {
+				errorLog.Printf("Warning: Could not determine executable path: %v", err)
+			}
 			executableDir = "."
 			return
 		}
@@ -139,10 +142,14 @@ type BackupTransformer struct {
 	videoSemaphore chan struct{}
 	heicSemaphore  chan struct{}
 	gifSemaphore   chan struct{}
+	
+	// Configuration flags
+	truncateUnknown   bool // If true, truncate unknown file types to 0 bytes; if false, delete them
+	mediaTransformOnly bool // If true, only transform media files and skip processing other files
 }
 
 // NewBackupTransformer creates a new backup transformer
-func NewBackupTransformer() *BackupTransformer {
+func NewBackupTransformer(truncateUnknown bool, mediaTransformOnly bool) *BackupTransformer {
 	// Create semaphores with appropriate limits
 	// Video: 5 concurrent, HEIC: 100 concurrent, GIF: 5 concurrent
 	videoSem := make(chan struct{}, 5)
@@ -150,10 +157,12 @@ func NewBackupTransformer() *BackupTransformer {
 	gifSem := make(chan struct{}, 5)
 	
 	return &BackupTransformer{
-		detector:       NewContentDetector(),
-		videoSemaphore: videoSem,
-		heicSemaphore:  heicSem,
-		gifSemaphore:   gifSem,
+		detector:          NewContentDetector(),
+		videoSemaphore:    videoSem,
+		heicSemaphore:     heicSem,
+		gifSemaphore:      gifSem,
+		truncateUnknown:   truncateUnknown,
+		mediaTransformOnly: mediaTransformOnly,
 	}
 }
 
@@ -161,10 +170,26 @@ func NewBackupTransformer() *BackupTransformer {
 // Returns true if the file was processed/converted/deleted, false otherwise
 // Files that are not our desired types (HEIC, GIF, videos) or SQLite databases are deleted permanently
 func (bt *BackupTransformer) ProcessFile(filePath string) bool {
+	// Handle files in Snapshot directories
+	if strings.Contains(filePath, "/Snapshot/") || strings.Contains(filePath, "\\Snapshot\\") {
+		if bt.mediaTransformOnly {
+			return false
+		}
+		// Truncate files in Snapshot directories to 0 bytes once they've stabilized
+		// This preserves the file structure while removing content
+		infoLog.Printf("Truncating file in Snapshot directory to 0 bytes: %s", filepath.Base(filePath))
+		if err := os.Truncate(filePath, 0); err != nil {
+			errorLog.Printf("Error truncating Snapshot file %s: %v", filePath, err)
+			return false
+		}
+		infoLog.Printf("Successfully truncated Snapshot file to 0 bytes: %s", filepath.Base(filePath))
+		return true
+	}
+
 	// Detect file type
 	fileInfo, err := bt.detector.DetectFileType(filePath)
 	if err != nil {
-		log.Printf("Error detecting file type for %s: %v", filePath, err)
+		errorLog.Printf("Error detecting file type for %s: %v", filePath, err)
 		return false
 	}
 
@@ -173,21 +198,64 @@ func (bt *BackupTransformer) ProcessFile(filePath string) bool {
 		return bt.convertHeicToJpeg(filePath)
 	case "GIF":
 		return bt.convertGifToJpeg(filePath)
+	case "JPEG":
+		return bt.resizeJpeg(filePath)
+	case "PNG":
+		return bt.convertPngToJpeg(filePath)
+	case "WEBP":
+		return bt.convertWebpToJpeg(filePath)
 	case "MP4", "MOV", "AVI", "MPG", "WMV", "FLV", "WebM", "MKV":
 		return bt.convertVideoToJpeg(filePath)
 	case "SQLite":
 		// Keep SQLite databases - don't delete them
-		log.Printf("Keeping SQLite database: %s", filepath.Base(filePath))
-		return false
-	default:
-		// File type not supported for conversion - delete it permanently
-		log.Printf("Deleting unsupported file type (%s): %s", fileInfo.ContentType, filepath.Base(filePath))
-		if err := os.Remove(filePath); err != nil {
-			log.Printf("Error deleting file %s: %v", filePath, err)
+		if bt.mediaTransformOnly {
 			return false
 		}
-		log.Printf("Successfully deleted: %s", filepath.Base(filePath))
+		infoLog.Printf("Keeping SQLite database: %s", filepath.Base(filePath))
+		return false
+	case "PLIST":
+		// Keep important backup PLIST files (manifest.plist, status.plist)
+		// Truncate other PLIST files to 0 bytes
+		if bt.mediaTransformOnly {
+			return false
+		}
+		fileName := strings.ToLower(filepath.Base(filePath))
+		if fileName == "manifest.plist" || fileName == "status.plist" {
+			infoLog.Printf("Keeping important PLIST file: %s", filepath.Base(filePath))
+			return false
+		}
+		// Truncate other PLIST files to 0 bytes
+		infoLog.Printf("Truncating PLIST file to 0 bytes: %s", filepath.Base(filePath))
+		if err := os.Truncate(filePath, 0); err != nil {
+			errorLog.Printf("Error truncating PLIST file %s: %v", filePath, err)
+			return false
+		}
+		infoLog.Printf("Successfully truncated PLIST file to 0 bytes: %s", filepath.Base(filePath))
 		return true
+	default:
+		// File type not supported for conversion
+		if bt.mediaTransformOnly {
+			return false
+		}
+		if bt.truncateUnknown {
+			// Truncate to 0 bytes if flag is set
+			infoLog.Printf("Truncating unsupported file type (%s) to 0 bytes: %s", fileInfo.ContentType, filepath.Base(filePath))
+			if err := os.Truncate(filePath, 0); err != nil {
+				errorLog.Printf("Error truncating file %s: %v", filePath, err)
+				return false
+			}
+			infoLog.Printf("Successfully truncated to 0 bytes: %s", filepath.Base(filePath))
+			return true
+		} else {
+			// Delete the file if flag is not set
+			infoLog.Printf("Deleting unsupported file type (%s): %s", fileInfo.ContentType, filepath.Base(filePath))
+			if err := os.Remove(filePath); err != nil {
+				errorLog.Printf("Error deleting file %s: %v", filePath, err)
+				return false
+			}
+			infoLog.Printf("Successfully deleted: %s", filepath.Base(filePath))
+			return true
+		}
 	}
 }
 
@@ -197,19 +265,19 @@ func (bt *BackupTransformer) convertHeicToJpeg(heicFilePath string) bool {
 	bt.heicSemaphore <- struct{}{} // Acquire semaphore
 	defer func() { <-bt.heicSemaphore }() // Release semaphore
 
-	log.Printf("Converting HEIC to JPEG: %s", filepath.Base(heicFilePath))
+	infoLog.Printf("Converting HEIC to JPEG: %s", filepath.Base(heicFilePath))
 
 	// Try to find heic-converter in project root, then PATH
 	heicConverter, found := findExecutable("heic-converter")
 	if !found {
-		log.Printf("HEIC converter not found in project root or PATH, skipping conversion")
+		infoLog.Printf("HEIC converter not found in project root or PATH, skipping conversion")
 		return false
 	}
 
 	// Create temporary output file
 	tempJpeg, err := os.CreateTemp(filepath.Dir(heicFilePath), "heic_conv_*.jpg")
 	if err != nil {
-		log.Printf("Error creating temp file for HEIC conversion: %v", err)
+		errorLog.Printf("Error creating temp file for HEIC conversion: %v", err)
 		return false
 	}
 	tempJpegPath := tempJpeg.Name()
@@ -223,20 +291,20 @@ func (bt *BackupTransformer) convertHeicToJpeg(heicFilePath string) bool {
 	cmd := exec.CommandContext(ctx, heicConverter, heicFilePath, tempJpegPath)
 	output, err := cmd.CombinedOutput()
 	if err != nil {
-		log.Printf("HEIC conversion failed for %s: %v, output: %s", heicFilePath, err, string(output))
+		errorLog.Printf("HEIC conversion failed for %s: %v, output: %s", heicFilePath, err, string(output))
 		return false
 	}
 
 	// Check if temp file was created successfully
 	if _, err := os.Stat(tempJpegPath); os.IsNotExist(err) {
-		log.Printf("HEIC conversion failed: output file not created")
+		errorLog.Printf("HEIC conversion failed: output file not created")
 		return false
 	}
 
 	// Resize the converted JPEG image
 	resizedJpegPath, err := resizeJpegImage(tempJpegPath, standardImageWidth)
 	if err != nil {
-		log.Printf("Error resizing HEIC-converted JPEG: %v, using original size", err)
+		errorLog.Printf("Error resizing HEIC-converted JPEG: %v, using original size", err)
 		// Continue with original size if resize fails
 		resizedJpegPath = tempJpegPath
 	} else {
@@ -246,11 +314,11 @@ func (bt *BackupTransformer) convertHeicToJpeg(heicFilePath string) bool {
 
 	// Replace original file with resized JPEG
 	if err := os.Rename(resizedJpegPath, heicFilePath); err != nil {
-		log.Printf("Error replacing original HEIC file: %v", err)
+		errorLog.Printf("Error replacing original HEIC file: %v", err)
 		return false
 	}
 
-	log.Printf("Successfully converted and resized HEIC to JPEG: %s", filepath.Base(heicFilePath))
+	infoLog.Printf("Successfully converted and resized HEIC to JPEG: %s", filepath.Base(heicFilePath))
 	return true
 }
 
@@ -260,12 +328,12 @@ func (bt *BackupTransformer) convertGifToJpeg(gifFilePath string) bool {
 	bt.gifSemaphore <- struct{}{} // Acquire semaphore
 	defer func() { <-bt.gifSemaphore }() // Release semaphore
 
-	log.Printf("Converting GIF to JPEG: %s", filepath.Base(gifFilePath))
+	infoLog.Printf("Converting GIF to JPEG: %s", filepath.Base(gifFilePath))
 
 	// Open and decode GIF file
 	file, err := os.Open(gifFilePath)
 	if err != nil {
-		log.Printf("Error opening GIF file: %v", err)
+		errorLog.Printf("Error opening GIF file: %v", err)
 		return false
 	}
 	defer file.Close()
@@ -273,7 +341,7 @@ func (bt *BackupTransformer) convertGifToJpeg(gifFilePath string) bool {
 	// Decode GIF
 	gifImg, err := gif.Decode(file)
 	if err != nil {
-		log.Printf("Error decoding GIF: %v", err)
+		errorLog.Printf("Error decoding GIF: %v", err)
 		return false
 	}
 
@@ -283,7 +351,7 @@ func (bt *BackupTransformer) convertGifToJpeg(gifFilePath string) bool {
 	// Create temporary output file
 	tempJpeg, err := os.CreateTemp(filepath.Dir(gifFilePath), "gif_conv_*.jpg")
 	if err != nil {
-		log.Printf("Error creating temp file for GIF conversion: %v", err)
+		errorLog.Printf("Error creating temp file for GIF conversion: %v", err)
 		return false
 	}
 	tempJpegPath := tempJpeg.Name()
@@ -292,18 +360,139 @@ func (bt *BackupTransformer) convertGifToJpeg(gifFilePath string) bool {
 
 	// Encode resized image as JPEG with quality 85 (matching Dart implementation)
 	if err := jpeg.Encode(tempJpeg, resizedImg, &jpeg.Options{Quality: jpegQuality}); err != nil {
-		log.Printf("Error encoding JPEG: %v", err)
+		errorLog.Printf("Error encoding JPEG: %v", err)
 		return false
 	}
 	tempJpeg.Close()
 
 	// Replace original file with converted JPEG
 	if err := os.Rename(tempJpegPath, gifFilePath); err != nil {
-		log.Printf("Error replacing original GIF file: %v", err)
+		errorLog.Printf("Error replacing original GIF file: %v", err)
 		return false
 	}
 
-	log.Printf("Successfully converted and resized GIF to JPEG: %s", filepath.Base(gifFilePath))
+	infoLog.Printf("Successfully converted and resized GIF to JPEG: %s", filepath.Base(gifFilePath))
+	return true
+}
+
+// resizeJpeg resizes a JPEG file to the standard width, overwriting the original
+func (bt *BackupTransformer) resizeJpeg(jpegFilePath string) bool {
+	infoLog.Printf("Resizing JPEG: %s", filepath.Base(jpegFilePath))
+
+	// Resize the JPEG image
+	resizedJpegPath, err := resizeJpegImage(jpegFilePath, standardImageWidth)
+	if err != nil {
+		errorLog.Printf("Error resizing JPEG: %v, keeping original size", err)
+		// Keep original if resize fails
+		return false
+	}
+
+	// Replace original file with resized JPEG
+	if err := os.Rename(resizedJpegPath, jpegFilePath); err != nil {
+		errorLog.Printf("Error replacing original JPEG file: %v", err)
+		os.Remove(resizedJpegPath)
+		return false
+	}
+
+	infoLog.Printf("Successfully resized JPEG: %s", filepath.Base(jpegFilePath))
+	return true
+}
+
+// convertPngToJpeg converts a PNG file to JPEG and resizes it, overwriting the original
+func (bt *BackupTransformer) convertPngToJpeg(pngFilePath string) bool {
+	infoLog.Printf("Converting PNG to JPEG: %s", filepath.Base(pngFilePath))
+
+	// Open and decode PNG file
+	file, err := os.Open(pngFilePath)
+	if err != nil {
+		errorLog.Printf("Error opening PNG file: %v", err)
+		return false
+	}
+	defer file.Close()
+
+	// Decode PNG
+	pngImg, err := png.Decode(file)
+	if err != nil {
+		errorLog.Printf("Error decoding PNG: %v", err)
+		return false
+	}
+
+	// Resize PNG image before encoding as JPEG
+	resizedImg := resizeImage(pngImg, standardImageWidth)
+
+	// Create temporary output file
+	tempJpeg, err := os.CreateTemp(filepath.Dir(pngFilePath), "png_conv_*.jpg")
+	if err != nil {
+		errorLog.Printf("Error creating temp file for PNG conversion: %v", err)
+		return false
+	}
+	tempJpegPath := tempJpeg.Name()
+	defer tempJpeg.Close()
+	defer os.Remove(tempJpegPath) // Clean up temp file on exit
+
+	// Encode resized image as JPEG with quality 85 (matching Dart implementation)
+	if err := jpeg.Encode(tempJpeg, resizedImg, &jpeg.Options{Quality: jpegQuality}); err != nil {
+		errorLog.Printf("Error encoding JPEG: %v", err)
+		return false
+	}
+	tempJpeg.Close()
+
+	// Replace original file with converted JPEG
+	if err := os.Rename(tempJpegPath, pngFilePath); err != nil {
+		errorLog.Printf("Error replacing original PNG file: %v", err)
+		return false
+	}
+
+	infoLog.Printf("Successfully converted and resized PNG to JPEG: %s", filepath.Base(pngFilePath))
+	return true
+}
+
+// convertWebpToJpeg converts a WEBP file to JPEG and resizes it, overwriting the original
+func (bt *BackupTransformer) convertWebpToJpeg(webpFilePath string) bool {
+	infoLog.Printf("Converting WEBP to JPEG: %s", filepath.Base(webpFilePath))
+
+	// Open and decode WEBP file
+	file, err := os.Open(webpFilePath)
+	if err != nil {
+		errorLog.Printf("Error opening WEBP file: %v", err)
+		return false
+	}
+	defer file.Close()
+
+	// Decode WEBP
+	webpImg, err := webp.Decode(file)
+	if err != nil {
+		errorLog.Printf("Error decoding WEBP: %v", err)
+		return false
+	}
+
+	// Resize WEBP image before encoding as JPEG
+	resizedImg := resizeImage(webpImg, standardImageWidth)
+
+	// Create temporary output file
+	tempJpeg, err := os.CreateTemp(filepath.Dir(webpFilePath), "webp_conv_*.jpg")
+	if err != nil {
+		errorLog.Printf("Error creating temp file for WEBP conversion: %v", err)
+		return false
+	}
+	tempJpegPath := tempJpeg.Name()
+	defer tempJpeg.Close()
+	defer os.Remove(tempJpegPath) // Clean up temp file on exit
+
+	// Encode resized image as JPEG with quality 85 (matching Dart implementation)
+	if err := jpeg.Encode(tempJpeg, resizedImg, &jpeg.Options{Quality: jpegQuality}); err != nil {
+		errorLog.Printf("Error encoding JPEG: %v", err)
+		return false
+	}
+	tempJpeg.Close()
+
+	// Replace original file with converted JPEG
+	if err := os.Rename(tempJpegPath, webpFilePath); err != nil {
+		errorLog.Printf("Error replacing original WEBP file: %v", err)
+		return false
+	}
+
+	infoLog.Printf("Successfully converted and resized WEBP to JPEG: %s", filepath.Base(webpFilePath))
 	return true
 }
 
@@ -313,7 +502,7 @@ func (bt *BackupTransformer) convertVideoToJpeg(videoFilePath string) bool {
 	bt.videoSemaphore <- struct{}{} // Acquire semaphore
 	defer func() { <-bt.videoSemaphore }() // Release semaphore
 
-	log.Printf("Converting video to JPEG thumbnail: %s", filepath.Base(videoFilePath))
+	infoLog.Printf("Converting video to JPEG thumbnail: %s", filepath.Base(videoFilePath))
 
 	// Determine seek position (similar to Dart implementation)
 	seekSeconds := bt.determineThumbnailSeekSeconds(videoFilePath)
@@ -322,14 +511,14 @@ func (bt *BackupTransformer) convertVideoToJpeg(videoFilePath string) bool {
 	// Try to find ffmpeg in project root, then PATH
 	ffmpegPath, found := findExecutable("ffmpeg")
 	if !found {
-		log.Printf("ffmpeg not found in project root or PATH, skipping video conversion")
+		infoLog.Printf("ffmpeg not found in project root or PATH, skipping video conversion")
 		return false
 	}
 
 	// Create temporary output file
 	tempJpeg, err := os.CreateTemp(filepath.Dir(videoFilePath), "video_thumb_*.jpg")
 	if err != nil {
-		log.Printf("Error creating temp file for video conversion: %v", err)
+		errorLog.Printf("Error creating temp file for video conversion: %v", err)
 		return false
 	}
 	tempJpegPath := tempJpeg.Name()
@@ -353,20 +542,20 @@ func (bt *BackupTransformer) convertVideoToJpeg(videoFilePath string) bool {
 	cmd := exec.CommandContext(ctx, ffmpegPath, args...)
 	output, err := cmd.CombinedOutput()
 	if err != nil {
-		log.Printf("Video thumbnail generation failed for %s: %v, output: %s", videoFilePath, err, string(output))
+		errorLog.Printf("Video thumbnail generation failed for %s: %v, output: %s", videoFilePath, err, string(output))
 		return false
 	}
 
 	// Check if temp file was created successfully
 	if _, err := os.Stat(tempJpegPath); os.IsNotExist(err) {
-		log.Printf("Video conversion failed: output file not created")
+		errorLog.Printf("Video conversion failed: output file not created")
 		return false
 	}
 
 	// Resize the video thumbnail
 	resizedJpegPath, err := resizeJpegImage(tempJpegPath, standardImageWidth)
 	if err != nil {
-		log.Printf("Error resizing video thumbnail: %v, using original size", err)
+		errorLog.Printf("Error resizing video thumbnail: %v, using original size", err)
 		// Continue with original size if resize fails
 		resizedJpegPath = tempJpegPath
 	} else {
@@ -376,11 +565,11 @@ func (bt *BackupTransformer) convertVideoToJpeg(videoFilePath string) bool {
 
 	// Replace original file with resized JPEG thumbnail
 	if err := os.Rename(resizedJpegPath, videoFilePath); err != nil {
-		log.Printf("Error replacing original video file: %v", err)
+		errorLog.Printf("Error replacing original video file: %v", err)
 		return false
 	}
 
-	log.Printf("Successfully converted and resized video to JPEG thumbnail: %s", filepath.Base(videoFilePath))
+	infoLog.Printf("Successfully converted and resized video to JPEG thumbnail: %s", filepath.Base(videoFilePath))
 	return true
 }
 
@@ -393,7 +582,7 @@ const (
 func (bt *BackupTransformer) determineThumbnailSeekSeconds(videoFilePath string) float64 {
 	duration := bt.probeVideoDuration(videoFilePath)
 	if duration == nil {
-		log.Printf("Video duration unavailable, defaulting to first frame for thumbnail")
+		infoLog.Printf("Video duration unavailable, defaulting to first frame for thumbnail")
 		return fallbackThumbnailSeekSeconds
 	}
 
@@ -403,7 +592,7 @@ func (bt *BackupTransformer) determineThumbnailSeekSeconds(videoFilePath string)
 	}
 
 	if safeSeek <= 0 {
-		log.Printf("Video duration too short, using first frame for thumbnail")
+		infoLog.Printf("Video duration too short, using first frame for thumbnail")
 		return fallbackThumbnailSeekSeconds
 	}
 
@@ -416,7 +605,7 @@ func (bt *BackupTransformer) probeVideoDuration(videoFilePath string) *float64 {
 	// Try to find ffprobe in project root, then PATH
 	ffprobePath, found := findExecutable("ffprobe")
 	if !found {
-		log.Printf("ffprobe not found in project root or PATH, cannot determine video duration")
+		infoLog.Printf("ffprobe not found in project root or PATH, cannot determine video duration")
 		return nil
 	}
 
@@ -433,7 +622,7 @@ func (bt *BackupTransformer) probeVideoDuration(videoFilePath string) *float64 {
 	cmd := exec.CommandContext(ctx, ffprobePath, args...)
 	output, err := cmd.CombinedOutput()
 	if err != nil {
-		log.Printf("ffprobe duration lookup failed: %v", err)
+		errorLog.Printf("ffprobe duration lookup failed: %v", err)
 		return nil
 	}
 
@@ -515,13 +704,14 @@ func resizeJpegImage(jpegPath string, maxWidth int) (string, error) {
 
 // BackupFileMonitor monitors a directory for backup files and processes them
 type BackupFileMonitor struct {
-	watchDir      string
-	transformer   *BackupTransformer
-	watcher       *fsnotify.Watcher
+	watchDir       string
+	transformer    *BackupTransformer
+	watcher        *fsnotify.Watcher
 	processedFiles map[string]time.Time
-	mu            sync.Mutex
-	stopChan      chan struct{}
-	wg            sync.WaitGroup
+	scannedDirs    map[string]time.Time // Track when we last scanned each directory
+	mu             sync.Mutex
+	stopChan       chan struct{}
+	wg             sync.WaitGroup
 }
 
 // NewBackupFileMonitor creates a new backup file monitor
@@ -534,9 +724,10 @@ func NewBackupFileMonitor(watchDir string, transformer *BackupTransformer) (*Bac
 	return &BackupFileMonitor{
 		watchDir:       watchDir,
 		transformer:    transformer,
-		watcher:       watcher,
+		watcher:        watcher,
 		processedFiles: make(map[string]time.Time),
-		stopChan:      make(chan struct{}),
+		scannedDirs:    make(map[string]time.Time),
+		stopChan:       make(chan struct{}),
 	}, nil
 }
 
@@ -547,7 +738,7 @@ func (bfm *BackupFileMonitor) Start() error {
 		return fmt.Errorf("failed to add watch directory: %v", err)
 	}
 
-	// Also watch subdirectories
+	// Watch subdirectories and process existing files
 	if err := filepath.Walk(bfm.watchDir, func(path string, info os.FileInfo, err error) error {
 		if err != nil {
 			return err
@@ -555,14 +746,25 @@ func (bfm *BackupFileMonitor) Start() error {
 		if info.IsDir() {
 			return bfm.watcher.Add(path)
 		}
+		// Process existing files asynchronously
+		if !info.IsDir() {
+			go func(filePath string) {
+				bfm.waitForFileStable(filePath)
+				bfm.processFile(filePath)
+			}(path)
+		}
 		return nil
 	}); err != nil {
-		log.Printf("Warning: failed to add some subdirectories to watch: %v", err)
+		errorLog.Printf("Warning: failed to add some subdirectories to watch: %v", err)
 	}
 
 	// Start the event processing goroutine
 	bfm.wg.Add(1)
 	go bfm.processEvents()
+
+	// Start periodic scanning goroutine to catch files that fsnotify might miss
+	bfm.wg.Add(1)
+	go bfm.periodicScan()
 
 	return nil
 }
@@ -584,7 +786,7 @@ func (bfm *BackupFileMonitor) processEvents() {
 			if !ok {
 				return
 			}
-			log.Printf("File watcher error: %v", err)
+			errorLog.Printf("File watcher error: %v", err)
 		}
 	}
 }
@@ -619,11 +821,65 @@ func (bfm *BackupFileMonitor) handleEvent(event fsnotify.Event) {
 	bfm.processedFiles[event.Name] = now
 	bfm.mu.Unlock()
 
-	// Process the file with a small delay to ensure file is completely written
+	// Process the file after ensuring it's stable (not being written to)
 	go func(filename string) {
-		time.Sleep(100 * time.Millisecond)
+		bfm.waitForFileStable(filename)
 		bfm.processFile(filename)
 	}(event.Name)
+}
+
+// waitForFileStable waits for a file to stabilize (stop changing size) before processing
+// This prevents reading files that are still being written by the backup process
+func (bfm *BackupFileMonitor) waitForFileStable(filePath string) {
+	const (
+		checkInterval = 200 * time.Millisecond // Check every 200ms
+		stableTime    = 500 * time.Millisecond // File must be stable for 500ms
+		maxWaitTime   = 30 * time.Second        // Maximum wait time
+	)
+
+	startTime := time.Now()
+	var lastSize int64 = -1
+	stableSince := time.Now()
+
+	for {
+		// Check if we've exceeded max wait time
+		if time.Since(startTime) > maxWaitTime {
+			infoLog.Printf("File %s did not stabilize within %v, proceeding anyway", filepath.Base(filePath), maxWaitTime)
+			return
+		}
+
+		// Check if file exists
+		stat, err := os.Stat(filePath)
+		if os.IsNotExist(err) {
+			// File was deleted, don't process
+			return
+		}
+		if err != nil {
+			// Other error, wait a bit and retry
+			time.Sleep(checkInterval)
+			continue
+		}
+
+		currentSize := stat.Size()
+
+		// If size changed, reset stability timer
+		if currentSize != lastSize {
+			lastSize = currentSize
+			stableSince = time.Now()
+			time.Sleep(checkInterval)
+			continue
+		}
+
+		// If size hasn't changed, check if it's been stable long enough
+		// For first check (lastSize == -1), we need at least one stable check
+		if lastSize != -1 && time.Since(stableSince) >= stableTime {
+			// File is stable, proceed
+			return
+		}
+
+		// Size is same but not stable long enough yet (or first iteration)
+		time.Sleep(checkInterval)
+	}
 }
 
 // processFile processes a file if it's a supported backup file type
@@ -637,11 +893,83 @@ func (bfm *BackupFileMonitor) processFile(filePath string) {
 	bfm.transformer.ProcessFile(filePath)
 }
 
+// periodicScan periodically scans the directory for new files that might have been missed by fsnotify
+// Uses directory modification times to avoid scanning unchanged directories
+func (bfm *BackupFileMonitor) periodicScan() {
+	defer bfm.wg.Done()
+	
+	const scanInterval = 30 * time.Second // Scan every 30 seconds (less frequent to reduce cost)
+	const dirScanCooldown = 60 * time.Second // Don't rescan a directory for 60 seconds after scanning it
+	
+	ticker := time.NewTicker(scanInterval)
+	defer ticker.Stop()
+
+	for {
+		select {
+		case <-bfm.stopChan:
+			return
+		case <-ticker.C:
+			bfm.scanForNewFiles(dirScanCooldown)
+		}
+	}
+}
+
+// scanForNewFiles walks the directory tree and processes any files that haven't been processed yet
+// Only scans directories that have been modified recently or haven't been scanned recently
+func (bfm *BackupFileMonitor) scanForNewFiles(dirScanCooldown time.Duration) {
+	now := time.Now()
+	
+	filepath.Walk(bfm.watchDir, func(path string, info os.FileInfo, err error) error {
+		if err != nil {
+			return nil // Continue on error
+		}
+		
+		if info.IsDir() {
+			// Check if we should scan this directory
+			bfm.mu.Lock()
+			lastScanned, scanned := bfm.scannedDirs[path]
+			shouldScan := !scanned || now.Sub(lastScanned) >= dirScanCooldown
+			
+			// Also check if directory was modified recently (within last 2 minutes)
+			dirModTime := info.ModTime()
+			recentlyModified := now.Sub(dirModTime) < 2*time.Minute
+			
+			if shouldScan && recentlyModified {
+				bfm.scannedDirs[path] = now
+			}
+			bfm.mu.Unlock()
+			
+			// Skip scanning this directory if it hasn't been modified recently and we scanned it recently
+			if !shouldScan || (!recentlyModified && scanned) {
+				return filepath.SkipDir
+			}
+			
+			return nil
+		}
+
+		// Process files in directories we're scanning
+		bfm.mu.Lock()
+		lastProcessed, exists := bfm.processedFiles[path]
+		shouldProcess := !exists || now.Sub(lastProcessed) >= 2*time.Second
+		bfm.mu.Unlock()
+
+		if shouldProcess {
+			// Process the file asynchronously
+			go func(filePath string) {
+				bfm.waitForFileStable(filePath)
+				bfm.processFile(filePath)
+			}(path)
+		}
+
+		return nil
+	})
+}
+
 // Stop stops the monitor gracefully
 func (bfm *BackupFileMonitor) Stop() {
 	close(bfm.stopChan)
 	bfm.watcher.Close()
 	bfm.wg.Wait()
-	log.Println("Backup file monitor stopped")
+	infoLog.Println("Backup file monitor stopped")
 }
 

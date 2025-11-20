@@ -3,6 +3,7 @@ package main
 import (
 	"bytes"
 	"fmt"
+	"io"
 	"os"
 	"path/filepath"
 	"strings"
@@ -116,12 +117,28 @@ func (cd *ContentDetector) DetectFileType(filePath string) (*FileInfo, error) {
 		return nil, fmt.Errorf("failed to get file stats: %v", err)
 	}
 
+	// Handle empty files gracefully
+	if stat.Size() == 0 {
+		fileInfo := &FileInfo{
+			Path:        filePath,
+			Size:        0,
+			ContentType: "Unknown",
+			Extension:   filepath.Ext(filePath),
+			Description: "Empty File",
+			Confidence:  "None",
+		}
+		cd.enhanceWithHeuristics(fileInfo)
+		return fileInfo, nil
+	}
+
 	// Read first 64 bytes for magic number detection
 	buffer := make([]byte, 64)
 	n, err := file.Read(buffer)
-	if err != nil && n == 0 {
+	// EOF is expected when reading past end of file, only error if we got no data and it's not EOF
+	if err != nil && err != io.EOF && n == 0 {
 		return nil, fmt.Errorf("failed to read file: %v", err)
 	}
+	// If we got EOF but read some data, that's fine - just use what we got
 	buffer = buffer[:n]
 
 	// Detect content type

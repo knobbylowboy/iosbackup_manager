@@ -46,7 +46,7 @@ func TestBackupTransformerWithAttachmentFiles(t *testing.T) {
 	}
 
 	// Create backup transformer
-	transformer := NewBackupTransformer()
+	transformer := NewBackupTransformer(false, false)
 
 	// Test files from attachment_files (files have no extensions to match real-world iOS backup)
 	testFiles := []struct {
@@ -170,7 +170,7 @@ func TestBackupTransformerFileDetection(t *testing.T) {
 		t.Skipf("attachment_files directory not found, skipping test")
 	}
 
-	transformer := NewBackupTransformer()
+	transformer := NewBackupTransformer(false, false)
 
 	// Test all files in attachment_files for type detection
 	files, err := os.ReadDir(attachmentDir)

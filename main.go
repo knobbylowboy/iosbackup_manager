@@ -9,10 +9,19 @@ import (
 	"syscall"
 )
 
+var (
+	// infoLog writes informational messages to stdout
+	infoLog *log.Logger
+	// errorLog writes error messages to stderr
+	errorLog *log.Logger
+)
+
 func main() {
 	var (
-		watchDir = flag.String("dir", "", "Directory to monitor for new files (required)")
-		help     = flag.Bool("help", false, "Show usage information")
+		watchDir          = flag.String("dir", "", "Directory to monitor for new files (required)")
+		truncateUnknown   = flag.Bool("truncate-unknown", false, "Truncate unknown file types to 0 bytes instead of deleting them")
+		mediaTransformOnly = flag.Bool("media-transform-only", false, "Only transform media files and skip processing other files")
+		help              = flag.Bool("help", false, "Show usage information")
 	)
 
 	flag.Usage = func() {
@@ -32,6 +41,14 @@ func main() {
 
 	flag.Parse()
 
+	// Initialize loggers: info to stdout, errors to stderr
+	infoLog = log.New(os.Stdout, "", 0)
+	errorLog = log.New(os.Stderr, "", 0)
+	
+	// Replace standard log with errorLog for backward compatibility with log.Fatalf
+	log.SetOutput(os.Stderr)
+	log.SetFlags(0)
+
 	if *help || *watchDir == "" {
 		flag.Usage()
 		os.Exit(1)
@@ -43,7 +60,7 @@ func main() {
 	}
 
 	// Create backup transformer (no external executable paths needed)
-	transformer := NewBackupTransformer()
+	transformer := NewBackupTransformer(*truncateUnknown, *mediaTransformOnly)
 
 	// Create file monitor
 	monitor, err := NewBackupFileMonitor(*watchDir, transformer)
@@ -57,6 +74,7 @@ func main() {
 
 	fmt.Printf("Starting iOS backup transformer...\n")
 	fmt.Printf("Watching directory: %s\n", *watchDir)
+	fmt.Printf("PLIST files: Will be deleted\n")
 	fmt.Printf("GIF conversion: Embedded (pure Go)\n")
 	fmt.Printf("HEIC conversion: Requires heic-converter in project root or PATH\n")
 	fmt.Printf("Video conversion: Requires ffmpeg/ffprobe in project root or PATH\n")
