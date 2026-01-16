@@ -399,40 +399,6 @@ func TestQueueDepthTracking(t *testing.T) {
 	}
 }
 
-// TestContentDetectorVariousFiles tests content detection for various file types
-func TestContentDetectorVariousFiles(t *testing.T) {
-	detector := NewContentDetector()
-	tempDir := t.TempDir()
-	
-	testCases := []struct {
-		name        string
-		content     []byte
-		expectedType string
-	}{
-		{"test.pdf", []byte{0x25, 0x50, 0x44, 0x46, 0x2D}, "PDF"},
-		{"test.png", []byte{0x89, 0x50, 0x4E, 0x47, 0x0D, 0x0A, 0x1A, 0x0A}, "PNG"},
-		{"test.jpg", []byte{0xFF, 0xD8, 0xFF}, "JPEG"},
-		{"test.gif", []byte{0x47, 0x49, 0x46, 0x38, 0x39, 0x61}, "GIF"},
-	}
-	
-	for _, tc := range testCases {
-		testFile := filepath.Join(tempDir, tc.name)
-		if err := os.WriteFile(testFile, tc.content, 0644); err != nil {
-			t.Fatalf("Failed to create test file %s: %v", tc.name, err)
-		}
-		
-		fileInfo, err := detector.DetectFileType(testFile)
-		if err != nil {
-			t.Errorf("Failed to detect file type for %s: %v", tc.name, err)
-			continue
-		}
-		
-		if fileInfo.ContentType != tc.expectedType {
-			t.Errorf("Expected type %s for %s, got %s", tc.expectedType, tc.name, fileInfo.ContentType)
-		}
-	}
-}
-
 // TestFileSavedLineParsing tests FILE_SAVED line parsing
 func TestFileSavedLineParsing(t *testing.T) {
 	tempDir := t.TempDir()

@@ -187,8 +187,6 @@ type FileTiming struct {
 
 // BackupTransformer handles conversion of backup files
 type BackupTransformer struct {
-	detector *ContentDetector
-	
 	// Semaphores to limit concurrent operations
 	videoSemaphore chan struct{}
 	heicSemaphore  chan struct{}
@@ -208,7 +206,6 @@ func NewBackupTransformer() *BackupTransformer {
 	gifSem := make(chan struct{}, 5)
 	
 	return &BackupTransformer{
-		detector:       NewContentDetector(),
 		videoSemaphore: videoSem,
 		heicSemaphore:  heicSem,
 		gifSemaphore:   gifSem,
@@ -252,40 +249,6 @@ func (bt *BackupTransformer) ProcessFileByExtension(filePath string, fileExt str
 		bt.convertVideoToJpeg(filePath, timing)
 	default:
 		// Not a media file, skip (ios_backup already filtered what we need)
-	}
-}
-
-// ProcessFile processes a file based on its detected type (legacy method, kept for compatibility)
-// Only performs media transformations - no deletions or truncations
-func (bt *BackupTransformer) ProcessFile(filePath string, timing *FileTiming) {
-	// Detect file type
-	fileInfo, err := bt.detector.DetectFileType(filePath)
-	if err != nil {
-		errorLog.Printf("Error detecting file type for %s: %v", filePath, err)
-		return
-	}
-
-	// Set transformation start time
-	if timing != nil {
-		timing.TransformationStartTime = time.Now()
-	}
-
-	// Only process media files - ios_backup already filtered what we need
-	switch fileInfo.ContentType {
-	case "HEIC":
-		bt.convertHeicToJpeg(filePath, timing)
-	case "GIF":
-		bt.convertGifToJpeg(filePath, timing)
-	case "JPEG":
-		bt.resizeJpeg(filePath, timing)
-	case "PNG":
-		bt.convertPngToJpeg(filePath, timing)
-	case "WEBP":
-		bt.convertWebpToJpeg(filePath, timing)
-	case "MP4", "MOV", "AVI", "MPG", "WMV", "FLV", "WebM", "MKV", "3GP", "TS", "VOB", "OGV":
-		bt.convertVideoToJpeg(filePath, timing)
-	default:
-		// Not a media file, skip (ios_backup handles filtering)
 	}
 }
 

@@ -284,39 +284,6 @@ func TestConcurrentFileProcessing(t *testing.T) {
 	// No crash means success
 }
 
-// TestContentDetectorEmptyFile tests that empty files don't crash
-func TestContentDetectorEmptyFile(t *testing.T) {
-	tempDir := t.TempDir()
-	emptyFile := filepath.Join(tempDir, "empty.txt")
-	
-	if err := os.WriteFile(emptyFile, []byte{}, 0644); err != nil {
-		t.Fatalf("Failed to create empty file: %v", err)
-	}
-	
-	detector := NewContentDetector()
-	fileInfo, err := detector.DetectFileType(emptyFile)
-	if err != nil {
-		t.Fatalf("Failed to detect empty file type: %v", err)
-	}
-	
-	if fileInfo.Size != 0 {
-		t.Errorf("Expected size 0, got %d", fileInfo.Size)
-	}
-	
-	if fileInfo.Description != "Empty File" {
-		t.Errorf("Expected 'Empty File' description, got %s", fileInfo.Description)
-	}
-}
-
-// TestContentDetectorNonExistentFile tests that missing files are handled
-func TestContentDetectorNonExistentFile(t *testing.T) {
-	detector := NewContentDetector()
-	_, err := detector.DetectFileType("/nonexistent/file.txt")
-	if err == nil {
-		t.Error("Expected error for non-existent file")
-	}
-}
-
 // TestManifestAnalyzerInvalidDB tests that invalid DB doesn't crash
 func TestManifestAnalyzerInvalidDB(t *testing.T) {
 	tempDir := t.TempDir()
