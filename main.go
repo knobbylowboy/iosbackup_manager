@@ -102,7 +102,11 @@ func main() {
 	// Validate backup directory parent exists (backup dir itself may not exist yet)
 	backupParent := filepath.Dir(*backupDir)
 	if _, err := os.Stat(backupParent); os.IsNotExist(err) {
-		log.Fatalf("Backup directory parent does not exist: %s", backupParent)
+		errorLog.Printf("Backup directory parent does not exist: %s", backupParent)
+		if logFileHandle != nil {
+			logFileHandle.Close()
+		}
+		os.Exit(1)
 	}
 
 	// Create backup transformer
@@ -111,7 +115,11 @@ func main() {
 	// Create backup runner
 	runner, err := NewBackupRunner(*backupDir, *iosBackup, *verbose, transformer)
 	if err != nil {
-		log.Fatalf("Failed to initialize backup runner: %v", err)
+		errorLog.Printf("Failed to initialize backup runner: %v", err)
+		if logFileHandle != nil {
+			logFileHandle.Close()
+		}
+		os.Exit(1)
 	}
 	
 	// Set log file in runner if specified
@@ -138,17 +146,26 @@ func main() {
 	}()
 
 	// Wait for either completion or shutdown signal
+	exitCode := 0
 	select {
 	case err := <-errChan:
 		if err != nil {
-			log.Fatalf("Backup failed: %v", err)
+			errorLog.Printf("Backup failed: %v", err)
+			exitCode = 1
+		} else {
+			fmt.Println("\nBackup completed successfully")
 		}
-		fmt.Println("\nBackup completed successfully")
 		runner.Stop()
 	case <-sigChan:
 		fmt.Println("\nShutting down gracefully...")
 		runner.Stop()
 		fmt.Println("Shutdown complete")
 	}
+	
+	// Cleanup and exit
+	if logFileHandle != nil {
+		logFileHandle.Close()
+	}
+	os.Exit(exitCode)
 }
 

@@ -117,14 +117,15 @@ const (
 
 // resizeImage resizes an image to the specified width while maintaining aspect ratio
 // Uses a simple nearest-neighbor algorithm - good enough for our use case
-func resizeImage(img image.Image, maxWidth int) image.Image {
+// Includes memory allocation guards to prevent OOM crashes
+func resizeImage(img image.Image, maxWidth int) (image.Image, error) {
 	bounds := img.Bounds()
 	width := bounds.Dx()
 	height := bounds.Dy()
 
 	// If image is already smaller than maxWidth, return as-is
 	if width <= maxWidth {
-		return img
+		return img, nil
 	}
 
 	// Calculate new height maintaining aspect ratio
@@ -133,8 +134,36 @@ func resizeImage(img image.Image, maxWidth int) image.Image {
 		newHeight = 1
 	}
 
-	// Create new RGBA image for resizing
-	resized := image.NewRGBA(image.Rect(0, 0, maxWidth, newHeight))
+	// Guard against unreasonably large allocations (> 50MB for a single image)
+	// RGBA uses 4 bytes per pixel
+	estimatedBytes := int64(maxWidth) * int64(newHeight) * 4
+	const maxAllocationBytes = 50 * 1024 * 1024 // 50 MB
+	if estimatedBytes > maxAllocationBytes {
+		return nil, fmt.Errorf("image too large to resize safely: would require %d MB", estimatedBytes/(1024*1024))
+	}
+
+	// Create new RGBA image for resizing (with panic recovery in case of allocation failure)
+	var resized *image.RGBA
+	var allocationErr error
+	func() {
+		defer func() {
+			if r := recover(); r != nil {
+				if errorLog != nil {
+					errorLog.Printf("Memory allocation panic during image resize: %v", r)
+				}
+				allocationErr = fmt.Errorf("memory allocation failed: %v", r)
+			}
+		}()
+		resized = image.NewRGBA(image.Rect(0, 0, maxWidth, newHeight))
+	}()
+	
+	if allocationErr != nil {
+		return nil, allocationErr
+	}
+	
+	if resized == nil {
+		return nil, fmt.Errorf("failed to allocate memory for resized image")
+	}
 	
 	// Simple nearest-neighbor resize
 	for y := 0; y < newHeight; y++ {
@@ -145,7 +174,7 @@ func resizeImage(img image.Image, maxWidth int) image.Image {
 		}
 	}
 
-	return resized
+	return resized, nil
 }
 
 // FileTiming holds timing information for file processing
@@ -289,17 +318,36 @@ func (bt *BackupTransformer) convertHeicToJpeg(heicFilePath string, timing *File
 		return
 	}
 	tempJpegPath := tempJpeg.Name()
-	tempJpeg.Close()
-	defer os.Remove(tempJpegPath) // Clean up temp file on exit
+	if err := tempJpeg.Close(); err != nil {
+		errorLog.Printf("Warning: error closing temp file: %v", err)
+	}
+	
+	// Setup cleanup
+	cleanupTemp := true
+	defer func() {
+		if cleanupTemp {
+			if err := os.Remove(tempJpegPath); err != nil && !os.IsNotExist(err) {
+				errorLog.Printf("Warning: failed to remove temp file %s: %v", tempJpegPath, err)
+			}
+		}
+	}()
 
-	// Run conversion
+	// Run conversion with timeout
 	ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
 	defer cancel()
 
 	cmd := exec.CommandContext(ctx, heicConverter, heicFilePath, tempJpegPath)
 	output, err := cmd.CombinedOutput()
 	if err != nil {
-		errorLog.Printf("HEIC conversion failed for %s: %v, output: %s", heicFilePath, err, string(output))
+		// Provide better error context
+		if ctx.Err() == context.DeadlineExceeded {
+			errorLog.Printf("HEIC conversion timed out after 30 seconds for %s", heicFilePath)
+		} else if exitErr, ok := err.(*exec.ExitError); ok {
+			errorLog.Printf("HEIC converter crashed or failed for %s: exit code %d, output: %s", 
+				heicFilePath, exitErr.ExitCode(), string(output))
+		} else {
+			errorLog.Printf("HEIC conversion failed for %s: %v, output: %s", heicFilePath, err, string(output))
+		}
 		return
 	}
 
@@ -317,7 +365,9 @@ func (bt *BackupTransformer) convertHeicToJpeg(heicFilePath string, timing *File
 		resizedJpegPath = tempJpegPath
 	} else {
 		// Remove the original temp file if resize succeeded
-		os.Remove(tempJpegPath)
+		if err := os.Remove(tempJpegPath); err != nil && !os.IsNotExist(err) {
+			errorLog.Printf("Warning: failed to remove intermediate temp file: %v", err)
+		}
 	}
 
 	// Replace original file with resized JPEG
@@ -325,6 +375,9 @@ func (bt *BackupTransformer) convertHeicToJpeg(heicFilePath string, timing *File
 		errorLog.Printf("Error replacing original HEIC file: %v", err)
 		return
 	}
+	
+	// Don't cleanup temp file since we successfully renamed it
+	cleanupTemp = false
 
 	duration := time.Since(transformStart)
 	infoLog.Printf("%sSuccessfully converted and resized HEIC to JPEG: %s [duration: %v]", bt.getQueueDepthString(), filepath.Base(heicFilePath), duration)
@@ -362,7 +415,11 @@ func (bt *BackupTransformer) convertGifToJpeg(gifFilePath string, timing *FileTi
 	}
 
 	// Resize GIF image before encoding as JPEG
-	resizedImg := resizeImage(gifImg, standardImageWidth)
+	resizedImg, err := resizeImage(gifImg, standardImageWidth)
+	if err != nil {
+		errorLog.Printf("Error resizing GIF image: %v", err)
+		return
+	}
 
 	// Create temporary output file
 	tempJpeg, err := os.CreateTemp(filepath.Dir(gifFilePath), "gif_conv_*.jpg")
@@ -371,21 +428,37 @@ func (bt *BackupTransformer) convertGifToJpeg(gifFilePath string, timing *FileTi
 		return
 	}
 	tempJpegPath := tempJpeg.Name()
-	defer tempJpeg.Close()
-	defer os.Remove(tempJpegPath) // Clean up temp file on exit
+	
+	// Setup cleanup
+	cleanupTemp := true
+	defer func() {
+		if cleanupTemp {
+			tempJpeg.Close()
+			if err := os.Remove(tempJpegPath); err != nil && !os.IsNotExist(err) {
+				errorLog.Printf("Warning: failed to remove temp file %s: %v", tempJpegPath, err)
+			}
+		}
+	}()
 
 	// Encode resized image as JPEG with quality 85 (matching Dart implementation)
 	if err := jpeg.Encode(tempJpeg, resizedImg, &jpeg.Options{Quality: jpegQuality}); err != nil {
 		errorLog.Printf("Error encoding JPEG: %v", err)
 		return
 	}
-	tempJpeg.Close()
+	
+	// Close the file before rename
+	if err := tempJpeg.Close(); err != nil {
+		errorLog.Printf("Warning: error closing temp JPEG file: %v", err)
+	}
 
 	// Replace original file with converted JPEG
 	if err := os.Rename(tempJpegPath, gifFilePath); err != nil {
 		errorLog.Printf("Error replacing original GIF file: %v", err)
 		return
 	}
+	
+	// Don't cleanup temp file since we successfully renamed it
+	cleanupTemp = false
 
 	duration := time.Since(transformStart)
 	infoLog.Printf("%sSuccessfully converted and resized GIF to JPEG: %s [duration: %v]", bt.getQueueDepthString(), filepath.Base(gifFilePath), duration)
@@ -413,7 +486,9 @@ func (bt *BackupTransformer) resizeJpeg(jpegFilePath string, timing *FileTiming)
 	// Replace original file with resized JPEG
 	if err := os.Rename(resizedJpegPath, jpegFilePath); err != nil {
 		errorLog.Printf("Error replacing original JPEG file: %v", err)
-		os.Remove(resizedJpegPath)
+		if rmErr := os.Remove(resizedJpegPath); rmErr != nil && !os.IsNotExist(rmErr) {
+			errorLog.Printf("Warning: failed to cleanup resized file: %v", rmErr)
+		}
 		return
 	}
 
@@ -449,7 +524,11 @@ func (bt *BackupTransformer) convertPngToJpeg(pngFilePath string, timing *FileTi
 	}
 
 	// Resize PNG image before encoding as JPEG
-	resizedImg := resizeImage(pngImg, standardImageWidth)
+	resizedImg, err := resizeImage(pngImg, standardImageWidth)
+	if err != nil {
+		errorLog.Printf("Error resizing PNG image: %v", err)
+		return
+	}
 
 	// Create temporary output file
 	tempJpeg, err := os.CreateTemp(filepath.Dir(pngFilePath), "png_conv_*.jpg")
@@ -458,21 +537,37 @@ func (bt *BackupTransformer) convertPngToJpeg(pngFilePath string, timing *FileTi
 		return
 	}
 	tempJpegPath := tempJpeg.Name()
-	defer tempJpeg.Close()
-	defer os.Remove(tempJpegPath) // Clean up temp file on exit
+	
+	// Setup cleanup
+	cleanupTemp := true
+	defer func() {
+		if cleanupTemp {
+			tempJpeg.Close()
+			if err := os.Remove(tempJpegPath); err != nil && !os.IsNotExist(err) {
+				errorLog.Printf("Warning: failed to remove temp file %s: %v", tempJpegPath, err)
+			}
+		}
+	}()
 
 	// Encode resized image as JPEG with quality 85 (matching Dart implementation)
 	if err := jpeg.Encode(tempJpeg, resizedImg, &jpeg.Options{Quality: jpegQuality}); err != nil {
 		errorLog.Printf("Error encoding JPEG: %v", err)
 		return
 	}
-	tempJpeg.Close()
+	
+	// Close the file before rename
+	if err := tempJpeg.Close(); err != nil {
+		errorLog.Printf("Warning: error closing temp JPEG file: %v", err)
+	}
 
 	// Replace original file with converted JPEG
 	if err := os.Rename(tempJpegPath, pngFilePath); err != nil {
 		errorLog.Printf("Error replacing original PNG file: %v", err)
 		return
 	}
+	
+	// Don't cleanup temp file since we successfully renamed it
+	cleanupTemp = false
 
 	duration := time.Since(transformStart)
 	infoLog.Printf("%sSuccessfully converted and resized PNG to JPEG: %s [duration: %v]", bt.getQueueDepthString(), filepath.Base(pngFilePath), duration)
@@ -506,7 +601,11 @@ func (bt *BackupTransformer) convertWebpToJpeg(webpFilePath string, timing *File
 	}
 
 	// Resize WEBP image before encoding as JPEG
-	resizedImg := resizeImage(webpImg, standardImageWidth)
+	resizedImg, err := resizeImage(webpImg, standardImageWidth)
+	if err != nil {
+		errorLog.Printf("Error resizing WEBP image: %v", err)
+		return
+	}
 
 	// Create temporary output file
 	tempJpeg, err := os.CreateTemp(filepath.Dir(webpFilePath), "webp_conv_*.jpg")
@@ -515,21 +614,37 @@ func (bt *BackupTransformer) convertWebpToJpeg(webpFilePath string, timing *File
 		return
 	}
 	tempJpegPath := tempJpeg.Name()
-	defer tempJpeg.Close()
-	defer os.Remove(tempJpegPath) // Clean up temp file on exit
+	
+	// Setup cleanup
+	cleanupTemp := true
+	defer func() {
+		if cleanupTemp {
+			tempJpeg.Close()
+			if err := os.Remove(tempJpegPath); err != nil && !os.IsNotExist(err) {
+				errorLog.Printf("Warning: failed to remove temp file %s: %v", tempJpegPath, err)
+			}
+		}
+	}()
 
 	// Encode resized image as JPEG with quality 85 (matching Dart implementation)
 	if err := jpeg.Encode(tempJpeg, resizedImg, &jpeg.Options{Quality: jpegQuality}); err != nil {
 		errorLog.Printf("Error encoding JPEG: %v", err)
 		return
 	}
-	tempJpeg.Close()
+	
+	// Close the file before rename
+	if err := tempJpeg.Close(); err != nil {
+		errorLog.Printf("Warning: error closing temp JPEG file: %v", err)
+	}
 
 	// Replace original file with converted JPEG
 	if err := os.Rename(tempJpegPath, webpFilePath); err != nil {
 		errorLog.Printf("Error replacing original WEBP file: %v", err)
 		return
 	}
+	
+	// Don't cleanup temp file since we successfully renamed it
+	cleanupTemp = false
 
 	duration := time.Since(transformStart)
 	infoLog.Printf("%sSuccessfully converted and resized WEBP to JPEG: %s [duration: %v]", bt.getQueueDepthString(), filepath.Base(webpFilePath), duration)
@@ -575,10 +690,21 @@ func (bt *BackupTransformer) convertVideoToJpeg(videoFilePath string, timing *Fi
 		return
 	}
 	tempJpegPath := tempJpeg.Name()
-	tempJpeg.Close()
-	defer os.Remove(tempJpegPath) // Clean up temp file on exit
+	if err := tempJpeg.Close(); err != nil {
+		errorLog.Printf("Warning: error closing temp file: %v", err)
+	}
+	
+	// Setup cleanup
+	cleanupTemp := true
+	defer func() {
+		if cleanupTemp {
+			if err := os.Remove(tempJpegPath); err != nil && !os.IsNotExist(err) {
+				errorLog.Printf("Warning: failed to remove temp file %s: %v", tempJpegPath, err)
+			}
+		}
+	}()
 
-	// Run ffmpeg to extract thumbnail
+	// Run ffmpeg to extract thumbnail with timeout
 	ctx, cancel := context.WithTimeout(context.Background(), 60*time.Second)
 	defer cancel()
 
@@ -595,7 +721,15 @@ func (bt *BackupTransformer) convertVideoToJpeg(videoFilePath string, timing *Fi
 	cmd := exec.CommandContext(ctx, ffmpegPath, args...)
 	output, err := cmd.CombinedOutput()
 	if err != nil {
-		errorLog.Printf("Video thumbnail generation failed for %s: %v, output: %s", videoFilePath, err, string(output))
+		// Provide better error context
+		if ctx.Err() == context.DeadlineExceeded {
+			errorLog.Printf("Video thumbnail generation timed out after 60 seconds for %s", videoFilePath)
+		} else if exitErr, ok := err.(*exec.ExitError); ok {
+			errorLog.Printf("ffmpeg crashed or failed for %s: exit code %d, output: %s", 
+				videoFilePath, exitErr.ExitCode(), string(output))
+		} else {
+			errorLog.Printf("Video thumbnail generation failed for %s: %v, output: %s", videoFilePath, err, string(output))
+		}
 		return
 	}
 
@@ -613,7 +747,9 @@ func (bt *BackupTransformer) convertVideoToJpeg(videoFilePath string, timing *Fi
 		resizedJpegPath = tempJpegPath
 	} else {
 		// Remove the original temp file if resize succeeded
-		os.Remove(tempJpegPath)
+		if err := os.Remove(tempJpegPath); err != nil && !os.IsNotExist(err) {
+			errorLog.Printf("Warning: failed to remove intermediate temp file: %v", err)
+		}
 	}
 
 	// Replace original file with resized JPEG thumbnail
@@ -621,6 +757,9 @@ func (bt *BackupTransformer) convertVideoToJpeg(videoFilePath string, timing *Fi
 		errorLog.Printf("Error replacing original video file: %v", err)
 		return
 	}
+	
+	// Don't cleanup temp file since we successfully renamed it
+	cleanupTemp = false
 
 	duration := time.Since(transformStart)
 	infoLog.Printf("%sSuccessfully converted and resized video to JPEG thumbnail: %s [duration: %v]", bt.getQueueDepthString(), filepath.Base(videoFilePath), duration)
@@ -754,7 +893,11 @@ func resizeJpegImage(jpegPath string, maxWidth int) (string, error) {
 	if err != nil {
 		return "", fmt.Errorf("failed to open JPEG: %v", err)
 	}
-	defer file.Close()
+	defer func() {
+		if err := file.Close(); err != nil {
+			errorLog.Printf("Warning: error closing JPEG file: %v", err)
+		}
+	}()
 
 	jpegImg, err := jpeg.Decode(file)
 	if err != nil {
@@ -762,7 +905,10 @@ func resizeJpegImage(jpegPath string, maxWidth int) (string, error) {
 	}
 
 	// Resize the image
-	resizedImg := resizeImage(jpegImg, maxWidth)
+	resizedImg, err := resizeImage(jpegImg, maxWidth)
+	if err != nil {
+		return "", fmt.Errorf("failed to resize image: %v", err)
+	}
 
 	// Create temporary output file for resized JPEG
 	tempResized, err := os.CreateTemp(filepath.Dir(jpegPath), "resized_*.jpg")
@@ -770,19 +916,35 @@ func resizeJpegImage(jpegPath string, maxWidth int) (string, error) {
 		return "", fmt.Errorf("failed to create temp file: %v", err)
 	}
 	resizedPath := tempResized.Name()
-	tempResized.Close()
+	if err := tempResized.Close(); err != nil {
+		errorLog.Printf("Warning: error closing temp file: %v", err)
+	}
 
 	// Write resized JPEG
 	resizedFile, err := os.Create(resizedPath)
 	if err != nil {
-		os.Remove(resizedPath)
+		if rmErr := os.Remove(resizedPath); rmErr != nil && !os.IsNotExist(rmErr) {
+			errorLog.Printf("Warning: failed to cleanup temp file: %v", rmErr)
+		}
 		return "", fmt.Errorf("failed to create resized file: %v", err)
 	}
-	defer resizedFile.Close()
-
-	if err := jpeg.Encode(resizedFile, resizedImg, &jpeg.Options{Quality: jpegQuality}); err != nil {
-		os.Remove(resizedPath)
-		return "", fmt.Errorf("failed to encode resized JPEG: %v", err)
+	
+	// Ensure file is closed and handle errors
+	var encodeErr error
+	func() {
+		defer func() {
+			if err := resizedFile.Close(); err != nil {
+				errorLog.Printf("Warning: error closing resized file: %v", err)
+			}
+		}()
+		encodeErr = jpeg.Encode(resizedFile, resizedImg, &jpeg.Options{Quality: jpegQuality})
+	}()
+	
+	if encodeErr != nil {
+		if rmErr := os.Remove(resizedPath); rmErr != nil && !os.IsNotExist(rmErr) {
+			errorLog.Printf("Warning: failed to cleanup temp file: %v", rmErr)
+		}
+		return "", fmt.Errorf("failed to encode resized JPEG: %v", encodeErr)
 	}
 
 	return resizedPath, nil

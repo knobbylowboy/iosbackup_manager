@@ -46,7 +46,7 @@ func TestBackupTransformerWithAttachmentFiles(t *testing.T) {
 	}
 
 	// Create backup transformer
-	transformer := NewBackupTransformer(false, false)
+	transformer := NewBackupTransformer()
 
 	// Test files from attachment_files (files have no extensions to match real-world iOS backup)
 	testFiles := []struct {
@@ -104,18 +104,16 @@ func TestBackupTransformerWithAttachmentFiles(t *testing.T) {
 				return
 			}
 
-			// Process the file (create timing info for test)
-			stat, _ := os.Stat(destPath)
-			timing := &FileTiming{
-				CreatedTime:     stat.ModTime(),
-				DiscoveredTime:  time.Now(),
-				DiscoveryMethod: "test",
-			}
-			converted := transformer.ProcessFile(destPath, timing)
-			if !converted {
-				t.Logf("File %s was not converted (may not be supported or tool not available)", tt.name)
-				return
-			}
+		// Process the file (create timing info for test)
+		stat, _ := os.Stat(destPath)
+		timing := &FileTiming{
+			CreatedTime:     stat.ModTime(),
+			DiscoveredTime:  time.Now(),
+			DiscoveryMethod: "test",
+		}
+		// ProcessFile no longer returns a value
+		transformer.ProcessFile(destPath, timing)
+		// Continue regardless - conversion may have failed gracefully
 
 			// Check if file still exists
 			if _, err := os.Stat(destPath); os.IsNotExist(err) {
@@ -176,7 +174,7 @@ func TestBackupTransformerFileDetection(t *testing.T) {
 		t.Skipf("attachment_files directory not found, skipping test")
 	}
 
-	transformer := NewBackupTransformer(false, false)
+	transformer := NewBackupTransformer()
 
 	// Test all files in attachment_files for type detection
 	files, err := os.ReadDir(attachmentDir)

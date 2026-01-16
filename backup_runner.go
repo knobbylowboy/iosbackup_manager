@@ -60,7 +60,15 @@ func (br *BackupRunner) SetLogFile(logFile *os.File) {
 }
 
 // processFile processes a saved file reported by ios_backup
+// This function includes panic recovery to prevent crashes from malformed files
 func (br *BackupRunner) processFile(filePath string, domain string) {
+	// Recover from any panics to prevent crash
+	defer func() {
+		if r := recover(); r != nil {
+			errorLog.Printf("PANIC recovered in processFile for %s: %v", filepath.Base(filePath), r)
+		}
+	}()
+
 	// Skip if file no longer exists
 	stat, err := os.Stat(filePath)
 	if os.IsNotExist(err) {
@@ -171,8 +179,9 @@ func (br *BackupRunner) Run() error {
 	// Get parent directory of backup (ios_backup expects parent dir as backup destination)
 	backupParent := filepath.Dir(br.backupDir)
 	
-	// Create context for the command
-	ctx, cancel := context.WithCancel(context.Background())
+	// Create context with timeout for the command (24 hours max)
+	// This prevents indefinite hangs if ios_backup has issues
+	ctx, cancel := context.WithTimeout(context.Background(), 24*time.Hour)
 	defer cancel()
 
 	// Build command arguments with domain filters
@@ -210,12 +219,18 @@ func (br *BackupRunner) Run() error {
 	infoLog.Printf("Started ios_backup backup to: %s", br.backupDir)
 
 	// Process stdout (forward to console and parse for FILE_SAVED lines)
+	stdoutErrChan := make(chan error, 1)
 	br.wg.Add(1)
-	go br.processOutput(stdout, os.Stdout)
+	go func() {
+		stdoutErrChan <- br.processOutput(stdout, os.Stdout)
+	}()
 
 	// Process stderr (forward to console and parse for FILE_SAVED lines)
+	stderrErrChan := make(chan error, 1)
 	br.wg.Add(1)
-	go br.processStderr(stderr)
+	go func() {
+		stderrErrChan <- br.processStderr(stderr)
+	}()
 
 	// Wait for command to complete
 	err = cmd.Wait()
@@ -223,11 +238,29 @@ func (br *BackupRunner) Run() error {
 	// Wait for output processors to finish
 	br.wg.Wait()
 	
+	// Check for output processing errors
+	var outputErrors []string
+	if stdoutErr := <-stdoutErrChan; stdoutErr != nil {
+		outputErrors = append(outputErrors, fmt.Sprintf("stdout error: %v", stdoutErr))
+	}
+	if stderrErr := <-stderrErrChan; stderrErr != nil {
+		outputErrors = append(outputErrors, fmt.Sprintf("stderr error: %v", stderrErr))
+	}
+	
 	// Wait for all file processing to complete
 	br.processingWg.Wait()
 
+	// Report any command errors
 	if err != nil {
+		if ctx.Err() == context.DeadlineExceeded {
+			return fmt.Errorf("ios_backup timed out after 24 hours")
+		}
 		return fmt.Errorf("ios_backup failed: %v", err)
+	}
+
+	// Report output processing errors as warnings (non-fatal)
+	if len(outputErrors) > 0 {
+		errorLog.Printf("Warning: Output processing encountered errors: %v", outputErrors)
 	}
 
 	infoLog.Printf("ios_backup completed successfully")
@@ -235,7 +268,7 @@ func (br *BackupRunner) Run() error {
 }
 
 // processOutput processes output from stdout, parsing for FILE_SAVED lines and forwarding to console
-func (br *BackupRunner) processOutput(pipe io.Reader, output io.Writer) {
+func (br *BackupRunner) processOutput(pipe io.Reader, output io.Writer) error {
 	defer br.wg.Done()
 	
 	scanner := bufio.NewScanner(pipe)
@@ -250,10 +283,15 @@ func (br *BackupRunner) processOutput(pipe io.Reader, output io.Writer) {
 			if br.verbose {
 				infoLog.Printf("DEBUG: Detected FILE_SAVED #%d in stdout: %s (domain: %s)", filesSeen, filepath.Base(filePath), domain)
 			}
-			// Process the file asynchronously
+			// Process the file asynchronously with panic recovery
 			br.processingWg.Add(1)
 			go func(fp string, dom string) {
-				defer br.processingWg.Done()
+				defer func() {
+					if r := recover(); r != nil {
+						errorLog.Printf("PANIC recovered in file processing goroutine: %v", r)
+					}
+					br.processingWg.Done()
+				}()
 				br.processFile(fp, dom)
 			}(filePath, domain)
 		}
@@ -284,11 +322,13 @@ func (br *BackupRunner) processOutput(pipe io.Reader, output io.Writer) {
 
 	if err := scanner.Err(); err != nil {
 		errorLog.Printf("Error reading output: %v", err)
+		return fmt.Errorf("scanner error on stdout: %v", err)
 	}
+	return nil
 }
 
 // processStderr processes stderr output, forwarding it and parsing for FILE_SAVED lines
-func (br *BackupRunner) processStderr(pipe io.Reader) {
+func (br *BackupRunner) processStderr(pipe io.Reader) error {
 	defer br.wg.Done()
 	
 	scanner := bufio.NewScanner(pipe)
@@ -323,10 +363,15 @@ func (br *BackupRunner) processStderr(pipe io.Reader) {
 			if br.verbose {
 				infoLog.Printf("DEBUG: Detected FILE_SAVED #%d: %s (domain: %s)", filesSeen, filepath.Base(filePath), domain)
 			}
-			// Process the file asynchronously
+			// Process the file asynchronously with panic recovery
 			br.processingWg.Add(1)
 			go func(fp string, dom string) {
-				defer br.processingWg.Done()
+				defer func() {
+					if r := recover(); r != nil {
+						errorLog.Printf("PANIC recovered in file processing goroutine: %v", r)
+					}
+					br.processingWg.Done()
+				}()
 				br.processFile(fp, dom)
 			}(filePath, domain)
 		}
@@ -342,7 +387,9 @@ func (br *BackupRunner) processStderr(pipe io.Reader) {
 
 	if err := scanner.Err(); err != nil {
 		errorLog.Printf("Error reading stderr: %v", err)
+		return fmt.Errorf("scanner error on stderr: %v", err)
 	}
+	return nil
 }
 
 // Stop stops the backup runner gracefully
