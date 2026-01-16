@@ -247,7 +247,8 @@ func (bt *BackupTransformer) ProcessFileByExtension(filePath string, fileExt str
 		bt.convertPngToJpeg(filePath, timing)
 	case ".webp":
 		bt.convertWebpToJpeg(filePath, timing)
-	case ".mp4", ".mov", ".avi", ".mpg", ".mpeg", ".wmv", ".flv", ".webm", ".mkv", ".m4v":
+	case ".mp4", ".mov", ".avi", ".mpg", ".mpeg", ".wmv", ".flv", ".webm", ".mkv", ".m4v",
+		".3gp", ".3gpp", ".ts", ".m2ts", ".mts", ".vob", ".asf", ".ogv", ".ogg", ".f4v":
 		bt.convertVideoToJpeg(filePath, timing)
 	default:
 		// Not a media file, skip (ios_backup already filtered what we need)
@@ -281,7 +282,7 @@ func (bt *BackupTransformer) ProcessFile(filePath string, timing *FileTiming) {
 		bt.convertPngToJpeg(filePath, timing)
 	case "WEBP":
 		bt.convertWebpToJpeg(filePath, timing)
-	case "MP4", "MOV", "AVI", "MPG", "WMV", "FLV", "WebM", "MKV":
+	case "MP4", "MOV", "AVI", "MPG", "WMV", "FLV", "WebM", "MKV", "3GP", "TS", "VOB", "OGV":
 		bt.convertVideoToJpeg(filePath, timing)
 	default:
 		// Not a media file, skip (ios_backup handles filtering)

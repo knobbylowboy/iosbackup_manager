@@ -349,7 +349,11 @@ func TestProcessFileByExtension(t *testing.T) {
 		{"test.heic", ".heic"},
 		{"test.webp", ".webp"},
 		{"test.mp4", ".mp4"},
-		{"test.txt", ".txt"}, // Should be ignored
+		{"test.3gp", ".3gp"},   // Mobile video
+		{"test.ts", ".ts"},     // Transport stream
+		{"test.vob", ".vob"},   // DVD video
+		{"test.ogv", ".ogv"},   // Ogg video
+		{"test.txt", ".txt"},   // Should be ignored
 	}
 	
 	for _, tc := range testCases {
