@@ -104,8 +104,14 @@ func TestBackupTransformerWithAttachmentFiles(t *testing.T) {
 				return
 			}
 
-			// Process the file
-			converted := transformer.ProcessFile(destPath)
+			// Process the file (create timing info for test)
+			stat, _ := os.Stat(destPath)
+			timing := &FileTiming{
+				CreatedTime:     stat.ModTime(),
+				DiscoveredTime:  time.Now(),
+				DiscoveryMethod: "test",
+			}
+			converted := transformer.ProcessFile(destPath, timing)
 			if !converted {
 				t.Logf("File %s was not converted (may not be supported or tool not available)", tt.name)
 				return

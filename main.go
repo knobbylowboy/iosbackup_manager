@@ -3,10 +3,13 @@ package main
 import (
 	"flag"
 	"fmt"
+	"io"
 	"log"
 	"os"
 	"os/signal"
+	"path/filepath"
 	"syscall"
+	"time"
 )
 
 var (
@@ -18,77 +21,134 @@ var (
 
 func main() {
 	var (
-		watchDir          = flag.String("dir", "", "Directory to monitor for new files (required)")
-		truncateUnknown   = flag.Bool("truncate-unknown", false, "Truncate unknown file types to 0 bytes instead of deleting them")
-		mediaTransformOnly = flag.Bool("media-transform-only", false, "Only transform media files and skip processing other files")
-		help              = flag.Bool("help", false, "Show usage information")
+		backupDir  = flag.String("backup-dir", "", "Backup directory path (required)")
+		iosBackup  = flag.String("ios-backup", "ios_backup", "Path to ios_backup executable")
+		verbose    = flag.Bool("verbose", false, "Show verbose output including filtered files")
+		logFile    = flag.String("log-file", "", "Save output to a log file (optional)")
+		help       = flag.Bool("help", false, "Show usage information")
 	)
 
 	flag.Usage = func() {
-		fmt.Fprintf(os.Stderr, "iOS Backup Transformer - Monitors directories and converts backup files\n\n")
-		fmt.Fprintf(os.Stderr, "Usage: %s -dir <watch_directory>\n\n", os.Args[0])
+		fmt.Fprintf(os.Stderr, "iOS Backup Transformer - Runs ios_backup and converts media files during backup\n\n")
+		fmt.Fprintf(os.Stderr, "Usage: %s -backup-dir <backup_directory>\n\n", os.Args[0])
+		fmt.Fprintf(os.Stderr, "Description:\n")
+		fmt.Fprintf(os.Stderr, "  This tool runs ios_backup (modified idevicebackup2) that filters files by domain.\n")
+		fmt.Fprintf(os.Stderr, "  It parses the ios_backup output and transforms media files as they are saved.\n\n")
 		fmt.Fprintf(os.Stderr, "Options:\n")
 		flag.PrintDefaults()
 		fmt.Fprintf(os.Stderr, "\nExamples:\n")
-		fmt.Fprintf(os.Stderr, "  %s -dir /path/to/ios/backup\n", os.Args[0])
-		fmt.Fprintf(os.Stderr, "\nSupported file types:\n")
-		fmt.Fprintf(os.Stderr, "  - HEIC images -> JPEG (overwrites original, requires heic-converter)\n")
-		fmt.Fprintf(os.Stderr, "  - GIF images -> JPEG (overwrites original, uses embedded Go library)\n")
-		fmt.Fprintf(os.Stderr, "  - Video files (MP4, MOV, AVI) -> JPEG thumbnail (overwrites original, requires ffmpeg)\n")
+		fmt.Fprintf(os.Stderr, "  %s -backup-dir /path/to/ios/backup/00008110-000E785101F2401E\n", os.Args[0])
+		fmt.Fprintf(os.Stderr, "  %s -backup-dir /path/to/ios/backup/00008110-000E785101F2401E -verbose\n", os.Args[0])
+		fmt.Fprintf(os.Stderr, "  %s -backup-dir /path/to/ios/backup/00008110-000E785101F2401E -log-file backup.log\n", os.Args[0])
+		fmt.Fprintf(os.Stderr, "\nDomain filters (automatically applied):\n")
+		fmt.Fprintf(os.Stderr, "  - *SMS* / *sms* - Text messages\n")
+		fmt.Fprintf(os.Stderr, "  - *AddressBook* - Contacts\n")
+		fmt.Fprintf(os.Stderr, "  - *WhatsApp* / *whatsapp* - WhatsApp data\n")
+		fmt.Fprintf(os.Stderr, "  - *ChatStorage.sqlite* - WhatsApp chat database\n")
+		fmt.Fprintf(os.Stderr, "  - *Message/Media/* - WhatsApp media files\n")
+		fmt.Fprintf(os.Stderr, "\nMedia transformations:\n")
+		fmt.Fprintf(os.Stderr, "  - HEIC images -> JPEG (resized to 500px width, requires heic-converter)\n")
+		fmt.Fprintf(os.Stderr, "  - GIF images -> JPEG (resized to 500px width, pure Go)\n")
+		fmt.Fprintf(os.Stderr, "  - PNG images -> JPEG (resized to 500px width, pure Go)\n")
+		fmt.Fprintf(os.Stderr, "  - WEBP images -> JPEG (resized to 500px width, pure Go)\n")
+		fmt.Fprintf(os.Stderr, "  - JPEG images -> resized JPEG (500px width, pure Go)\n")
+		fmt.Fprintf(os.Stderr, "  - Videos (MP4, MOV, AVI, etc.) -> JPEG thumbnail (requires ffmpeg/ffprobe)\n")
 		fmt.Fprintf(os.Stderr, "\nNote: HEIC and video conversion require external tools (heic-converter, ffmpeg, ffprobe)\n")
-		fmt.Fprintf(os.Stderr, "      to be available in the project root (same directory as this executable) or PATH.\n")
+		fmt.Fprintf(os.Stderr, "      to be available in libraries folder, project root, or PATH.\n")
 	}
 
 	flag.Parse()
 
-	// Initialize loggers: info to stdout, errors to stderr
-	infoLog = log.New(os.Stdout, "", 0)
-	errorLog = log.New(os.Stderr, "", 0)
-	
-	// Replace standard log with errorLog for backward compatibility with log.Fatalf
-	log.SetOutput(os.Stderr)
-	log.SetFlags(0)
-
-	if *help || *watchDir == "" {
+	if *help || *backupDir == "" {
 		flag.Usage()
 		os.Exit(1)
 	}
 
-	// Validate watch directory exists
-	if _, err := os.Stat(*watchDir); os.IsNotExist(err) {
-		log.Fatalf("Watch directory does not exist: %s", *watchDir)
+	// Set up log file if specified
+	var logFileHandle *os.File
+	var err error
+	if *logFile != "" {
+		logFileHandle, err = os.Create(*logFile)
+		if err != nil {
+			fmt.Fprintf(os.Stderr, "Failed to create log file: %v\n", err)
+			os.Exit(1)
+		}
+		defer logFileHandle.Close()
+		
+		// Create multi-writers to output to both console and file
+		infoWriter := io.MultiWriter(os.Stdout, logFileHandle)
+		errorWriter := io.MultiWriter(os.Stderr, logFileHandle)
+		
+		infoLog = log.New(infoWriter, "", 0)
+		errorLog = log.New(errorWriter, "", 0)
+		
+		// Replace standard log with errorLog for backward compatibility
+		log.SetOutput(errorWriter)
+		log.SetFlags(0)
+		
+		fmt.Fprintf(logFileHandle, "iOS Backup Transformer - Log started at %s\n", time.Now().Format(time.RFC3339))
+		fmt.Fprintf(logFileHandle, "Backup directory: %s\n", *backupDir)
+		fmt.Fprintf(logFileHandle, "Verbose: %v\n\n", *verbose)
+	} else {
+		// Initialize loggers: info to stdout, errors to stderr
+		infoLog = log.New(os.Stdout, "", 0)
+		errorLog = log.New(os.Stderr, "", 0)
+		
+		// Replace standard log with errorLog for backward compatibility with log.Fatalf
+		log.SetOutput(os.Stderr)
+		log.SetFlags(0)
 	}
 
-	// Create backup transformer (no external executable paths needed)
-	transformer := NewBackupTransformer(*truncateUnknown, *mediaTransformOnly)
+	// Validate backup directory parent exists (backup dir itself may not exist yet)
+	backupParent := filepath.Dir(*backupDir)
+	if _, err := os.Stat(backupParent); os.IsNotExist(err) {
+		log.Fatalf("Backup directory parent does not exist: %s", backupParent)
+	}
 
-	// Create file monitor
-	monitor, err := NewBackupFileMonitor(*watchDir, transformer)
+	// Create backup transformer
+	transformer := NewBackupTransformer()
+
+	// Create backup runner
+	runner, err := NewBackupRunner(*backupDir, *iosBackup, *verbose, transformer)
 	if err != nil {
-		log.Fatalf("Failed to initialize file monitor: %v", err)
+		log.Fatalf("Failed to initialize backup runner: %v", err)
+	}
+	
+	// Set log file in runner if specified
+	if logFileHandle != nil {
+		runner.SetLogFile(logFileHandle)
 	}
 
 	// Set up signal handling for graceful shutdown
 	sigChan := make(chan os.Signal, 1)
 	signal.Notify(sigChan, os.Interrupt, syscall.SIGTERM)
 
-	fmt.Printf("Starting iOS backup transformer...\n")
-	fmt.Printf("Watching directory: %s\n", *watchDir)
-	fmt.Printf("PLIST files: Will be deleted\n")
-	fmt.Printf("GIF conversion: Embedded (pure Go)\n")
-	fmt.Printf("HEIC conversion: Requires heic-converter in project root or PATH\n")
-	fmt.Printf("Video conversion: Requires ffmpeg/ffprobe in project root or PATH\n")
-	fmt.Printf("Press Ctrl+C or send SIGTERM to stop\n\n")
+	fmt.Printf("Starting iOS backup with media transformation...\n")
+	fmt.Printf("Backup directory: %s\n", *backupDir)
+	fmt.Printf("ios_backup: %s\n", *iosBackup)
+	fmt.Printf("\nMedia transformations enabled:\n")
+	fmt.Printf("  - Image formats: HEIC, GIF, PNG, WEBP, JPEG -> JPEG (500px width)\n")
+	fmt.Printf("  - Video formats: MP4, MOV, AVI, etc. -> JPEG thumbnail\n")
+	fmt.Printf("\nPress Ctrl+C or send SIGTERM to stop\n\n")
 
-	// Start monitoring
-	if err := monitor.Start(); err != nil {
-		log.Fatalf("Failed to start monitoring: %v", err)
+	// Run backup in a goroutine
+	errChan := make(chan error, 1)
+	go func() {
+		errChan <- runner.Run()
+	}()
+
+	// Wait for either completion or shutdown signal
+	select {
+	case err := <-errChan:
+		if err != nil {
+			log.Fatalf("Backup failed: %v", err)
+		}
+		fmt.Println("\nBackup completed successfully")
+		runner.Stop()
+	case <-sigChan:
+		fmt.Println("\nShutting down gracefully...")
+		runner.Stop()
+		fmt.Println("Shutdown complete")
 	}
-
-	// Wait for shutdown signal
-	<-sigChan
-	fmt.Println("\nShutting down gracefully...")
-	monitor.Stop()
-	fmt.Println("Shutdown complete")
 }
 
