@@ -14,6 +14,14 @@ import (
 	"time"
 )
 
+// truncateString safely truncates a string to maxLen characters
+func truncateString(s string, maxLen int) string {
+	if len(s) <= maxLen {
+		return s
+	}
+	return s[:maxLen]
+}
+
 // BackupRunner runs ios_backup and processes files as they're reported
 type BackupRunner struct {
 	backupDir    string
@@ -271,110 +279,117 @@ func (br *BackupRunner) Run() error {
 func (br *BackupRunner) processOutput(pipe io.Reader, output io.Writer) error {
 	defer br.wg.Done()
 	
-	scanner := bufio.NewScanner(pipe)
+	reader := bufio.NewReader(pipe)
 	filesSeen := 0
-	for scanner.Scan() {
-		line := scanner.Text()
-		
-		// Parse for FILE_SAVED lines (they might be in stdout)
-		filePath, domain := br.parseSavedFileLine(line)
-		if filePath != "" {
-			filesSeen++
-			if br.verbose {
-				infoLog.Printf("DEBUG: Detected FILE_SAVED #%d in stdout: %s (domain: %s)", filesSeen, filepath.Base(filePath), domain)
+	lineCount := 0
+	
+	for {
+		line, err := reader.ReadString('\n')
+		if err != nil {
+			if err == io.EOF {
+				// Process final line if it doesn't end with newline
+				if len(line) > 0 {
+					lineCount++
+					br.processOutputLine(line, &filesSeen, lineCount, output)
+				}
+				break
 			}
-			// Process the file asynchronously with panic recovery
-			br.processingWg.Add(1)
-			go func(fp string, dom string) {
-				defer func() {
-					if r := recover(); r != nil {
-						errorLog.Printf("PANIC recovered in file processing goroutine: %v", r)
-					}
-					br.processingWg.Done()
-				}()
-				br.processFile(fp, dom)
-			}(filePath, domain)
+			errorLog.Printf("Error reading output: %v", err)
+			return fmt.Errorf("read error on stdout: %v", err)
 		}
 		
-		// Filter out noise unless verbose mode is enabled
-		shouldOutput := true
-		if !br.verbose {
-			// Skip empty lines and whitespace-only lines
-			if strings.TrimSpace(line) == "" {
-				shouldOutput = false
-			} else if strings.HasPrefix(line, "FILE_FILTERED:") || strings.HasPrefix(line, "Receiving domain:") {
-				shouldOutput = false
-			}
-		}
+		lineCount++
+		// Remove trailing newline
+		line = strings.TrimSuffix(line, "\n")
+		line = strings.TrimSuffix(line, "\r") // Handle Windows line endings
 		
-		if shouldOutput {
-			fmt.Fprintln(output, line)
-			// Also write to log file if specified
-			if br.logFile != nil {
-				fmt.Fprintln(br.logFile, line)
-			}
-		}
+		br.processOutputLine(line, &filesSeen, lineCount, output)
 	}
 
 	if filesSeen > 0 {
 		infoLog.Printf("Detected %d FILE_SAVED lines in stdout", filesSeen)
 	}
 
-	if err := scanner.Err(); err != nil {
-		errorLog.Printf("Error reading output: %v", err)
-		return fmt.Errorf("scanner error on stdout: %v", err)
-	}
 	return nil
+}
+
+// processOutputLine handles a single line of stdout output
+func (br *BackupRunner) processOutputLine(line string, filesSeen *int, lineCount int, output io.Writer) {
+	// Log unusually long lines to diagnose buffer issues
+	if len(line) > 1024 {
+		errorLog.Printf("WARNING: Unusually long line in stdout (%d bytes, line #%d). First 100 chars: %s...", 
+			len(line), lineCount, truncateString(line, 100))
+	}
+	
+	// Parse for FILE_SAVED lines (they might be in stdout)
+	filePath, domain := br.parseSavedFileLine(line)
+	if filePath != "" {
+		*filesSeen++
+		if br.verbose {
+			infoLog.Printf("DEBUG: Detected FILE_SAVED #%d in stdout: %s (domain: %s)", *filesSeen, filepath.Base(filePath), domain)
+		}
+		// Process the file asynchronously with panic recovery
+		br.processingWg.Add(1)
+		go func(fp string, dom string) {
+			defer func() {
+				if r := recover(); r != nil {
+					errorLog.Printf("PANIC recovered in file processing goroutine: %v", r)
+				}
+				br.processingWg.Done()
+			}()
+			br.processFile(fp, dom)
+		}(filePath, domain)
+	}
+	
+	// Filter out noise unless verbose mode is enabled
+	shouldOutput := true
+	if !br.verbose {
+		// Skip empty lines and whitespace-only lines
+		if strings.TrimSpace(line) == "" {
+			shouldOutput = false
+		} else if strings.HasPrefix(line, "FILE_FILTERED:") || strings.HasPrefix(line, "Receiving domain:") {
+			shouldOutput = false
+		}
+	}
+	
+	if shouldOutput {
+		fmt.Fprintln(output, line)
+		// Also write to log file if specified
+		if br.logFile != nil {
+			fmt.Fprintln(br.logFile, line)
+		}
+	}
 }
 
 // processStderr processes stderr output, forwarding it and parsing for FILE_SAVED lines
 func (br *BackupRunner) processStderr(pipe io.Reader) error {
 	defer br.wg.Done()
 	
-	scanner := bufio.NewScanner(pipe)
+	reader := bufio.NewReader(pipe)
 	filesSeen := 0
-	for scanner.Scan() {
-		line := scanner.Text()
-		
-		// Filter out noise unless verbose mode is enabled
-		shouldForward := true
-		if !br.verbose {
-			// Skip empty lines and whitespace-only lines
-			if strings.TrimSpace(line) == "" {
-				shouldForward = false
-			} else if strings.HasPrefix(line, "FILE_FILTERED:") || strings.HasPrefix(line, "Receiving domain:") {
-				shouldForward = false // Skip these lines in non-verbose mode
+	lineCount := 0
+	
+	for {
+		line, err := reader.ReadString('\n')
+		if err != nil {
+			if err == io.EOF {
+				// Process final line if it doesn't end with newline
+				if len(line) > 0 {
+					lineCount++
+					br.processStderrLine(line, &filesSeen, lineCount)
+				}
+				break
 			}
+			errorLog.Printf("Error reading stderr: %v", err)
+			return fmt.Errorf("read error on stderr: %v", err)
 		}
 		
-		// Forward the line to stderr (if not filtered)
-		if shouldForward {
-			fmt.Fprintln(os.Stderr, line)
-			// Also write to log file if specified
-			if br.logFile != nil {
-				fmt.Fprintln(br.logFile, line)
-			}
-		}
+		lineCount++
+		// Remove trailing newline
+		line = strings.TrimSuffix(line, "\n")
+		line = strings.TrimSuffix(line, "\r") // Handle Windows line endings
 		
-		// Parse for FILE_SAVED lines
-		filePath, domain := br.parseSavedFileLine(line)
-		if filePath != "" {
-			filesSeen++
-			if br.verbose {
-				infoLog.Printf("DEBUG: Detected FILE_SAVED #%d: %s (domain: %s)", filesSeen, filepath.Base(filePath), domain)
-			}
-			// Process the file asynchronously with panic recovery
-			br.processingWg.Add(1)
-			go func(fp string, dom string) {
-				defer func() {
-					if r := recover(); r != nil {
-						errorLog.Printf("PANIC recovered in file processing goroutine: %v", r)
-					}
-					br.processingWg.Done()
-				}()
-				br.processFile(fp, dom)
-			}(filePath, domain)
-		}
+		br.processStderrLine(line, &filesSeen, lineCount)
 	}
 
 	if br.verbose {
@@ -385,11 +400,56 @@ func (br *BackupRunner) processStderr(pipe io.Reader) error {
 		}
 	}
 
-	if err := scanner.Err(); err != nil {
-		errorLog.Printf("Error reading stderr: %v", err)
-		return fmt.Errorf("scanner error on stderr: %v", err)
-	}
 	return nil
+}
+
+// processStderrLine handles a single line of stderr output
+func (br *BackupRunner) processStderrLine(line string, filesSeen *int, lineCount int) {
+	// Log unusually long lines to diagnose buffer issues
+	if len(line) > 1024 {
+		errorLog.Printf("WARNING: Unusually long line in stderr (%d bytes, line #%d). First 100 chars: %s...", 
+			len(line), lineCount, truncateString(line, 100))
+	}
+	
+	// Filter out noise unless verbose mode is enabled
+	shouldForward := true
+	if !br.verbose {
+		// Skip empty lines and whitespace-only lines
+		if strings.TrimSpace(line) == "" {
+			shouldForward = false
+		} else if strings.HasPrefix(line, "FILE_FILTERED:") || strings.HasPrefix(line, "Receiving domain:") {
+			shouldForward = false // Skip these lines in non-verbose mode
+		}
+	}
+	
+	// Forward the line to stderr (if not filtered)
+	if shouldForward {
+		fmt.Fprintln(os.Stderr, line)
+		// Also write to log file if specified
+		if br.logFile != nil {
+			fmt.Fprintln(br.logFile, line)
+		}
+	}
+	
+	// Parse for FILE_SAVED lines
+	filePath, domain := br.parseSavedFileLine(line)
+	if filePath != "" {
+		*filesSeen++
+		if br.verbose {
+			infoLog.Printf("DEBUG: Detected FILE_SAVED #%d: %s (domain: %s)", *filesSeen, filepath.Base(filePath), domain)
+		}
+		// Process the file asynchronously with panic recovery
+		br.processingWg.Add(1)
+		go func(fp string, dom string) {
+			defer func() {
+				if r := recover(); r != nil {
+					errorLog.Printf("PANIC recovered in file processing goroutine: %v", r)
+				}
+				br.processingWg.Done()
+			}()
+			br.processFile(fp, dom)
+		}(filePath, domain)
+	}
 }
 
 // Stop stops the backup runner gracefully
