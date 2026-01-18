@@ -14,12 +14,65 @@ import (
 	"time"
 )
 
+const maxOutputLineBytes = 1024 * 1024
+
+var fileSavedRe = regexp.MustCompile(`path=([^\s]+)(?:\s+domain=([^\s]+))?`)
+
 // truncateString safely truncates a string to maxLen characters
 func truncateString(s string, maxLen int) string {
 	if len(s) <= maxLen {
 		return s
 	}
 	return s[:maxLen]
+}
+
+// readOutputLine reads until \n or \r, handling \r\n and oversized lines.
+func readOutputLine(reader *bufio.Reader) (string, error, bool) {
+	var buf []byte
+	truncated := false
+
+	for {
+		b, err := reader.ReadByte()
+		if err != nil {
+			if err == io.EOF && len(buf) > 0 {
+				return string(buf), io.EOF, truncated
+			}
+			return "", err, truncated
+		}
+
+		if b == '\n' || b == '\r' {
+			if b == '\r' {
+				if next, err := reader.Peek(1); err == nil && next[0] == '\n' {
+					_, _ = reader.ReadByte()
+				}
+			}
+			return string(buf), nil, truncated
+		}
+
+		if len(buf) < maxOutputLineBytes {
+			buf = append(buf, b)
+			continue
+		}
+
+		truncated = true
+		for {
+			b, err = reader.ReadByte()
+			if err != nil {
+				if err == io.EOF {
+					return string(buf), io.EOF, truncated
+				}
+				return string(buf), err, truncated
+			}
+			if b == '\n' || b == '\r' {
+				if b == '\r' {
+					if next, err := reader.Peek(1); err == nil && next[0] == '\n' {
+						_, _ = reader.ReadByte()
+					}
+				}
+				return string(buf), nil, truncated
+			}
+		}
+	}
 }
 
 // BackupRunner runs ios_backup and processes files as they're reported
@@ -35,6 +88,10 @@ type BackupRunner struct {
 	activeCount  int64          // Number of files currently being processed
 	totalCount   int64          // Total number of files processed or being processed
 	countMu      sync.Mutex     // Protects queue counters
+	cmdMu        sync.Mutex
+	cmd          *exec.Cmd
+	ctxCancel    context.CancelFunc
+	stopOnce     sync.Once
 }
 
 // NewBackupRunner creates a new backup runner that calls ios_backup
@@ -134,8 +191,7 @@ func (br *BackupRunner) parseSavedFileLine(line string) (string, string) {
 	}
 
 	// Use regex to extract path and domain
-	re := regexp.MustCompile(`path=([^\s]+)(?:\s+domain=([^\s]+))?`)
-	matches := re.FindStringSubmatch(line)
+	matches := fileSavedRe.FindStringSubmatch(line)
 	if len(matches) < 2 {
 		if br.verbose {
 			infoLog.Printf("DEBUG: Regex didn't match. Matches: %v", matches)
@@ -207,6 +263,16 @@ func (br *BackupRunner) Run() error {
 
 	// Start ios_backup with domain filters
 	cmd := exec.CommandContext(ctx, iosBackupPath, args...)
+	br.cmdMu.Lock()
+	br.cmd = cmd
+	br.ctxCancel = cancel
+	br.cmdMu.Unlock()
+	defer func() {
+		br.cmdMu.Lock()
+		br.cmd = nil
+		br.ctxCancel = nil
+		br.cmdMu.Unlock()
+	}()
 	
 	// Set up stdout and stderr pipes
 	stdout, err := cmd.StdoutPipe()
@@ -282,28 +348,23 @@ func (br *BackupRunner) processOutput(pipe io.Reader, output io.Writer) error {
 	reader := bufio.NewReader(pipe)
 	filesSeen := 0
 	lineCount := 0
-	
+
 	for {
-		line, err := reader.ReadString('\n')
+		line, err, truncated := readOutputLine(reader)
 		if err != nil {
 			if err == io.EOF {
-				// Process final line if it doesn't end with newline
 				if len(line) > 0 {
 					lineCount++
-					br.processOutputLine(line, &filesSeen, lineCount, output)
+					br.processOutputLine(line, &filesSeen, lineCount, output, truncated)
 				}
 				break
 			}
 			errorLog.Printf("Error reading output: %v", err)
 			return fmt.Errorf("read error on stdout: %v", err)
 		}
-		
+
 		lineCount++
-		// Remove trailing newline
-		line = strings.TrimSuffix(line, "\n")
-		line = strings.TrimSuffix(line, "\r") // Handle Windows line endings
-		
-		br.processOutputLine(line, &filesSeen, lineCount, output)
+		br.processOutputLine(line, &filesSeen, lineCount, output, truncated)
 	}
 
 	if filesSeen > 0 {
@@ -314,9 +375,9 @@ func (br *BackupRunner) processOutput(pipe io.Reader, output io.Writer) error {
 }
 
 // processOutputLine handles a single line of stdout output
-func (br *BackupRunner) processOutputLine(line string, filesSeen *int, lineCount int, output io.Writer) {
+func (br *BackupRunner) processOutputLine(line string, filesSeen *int, lineCount int, output io.Writer, truncated bool) {
 	// Log unusually long lines to diagnose buffer issues
-	if len(line) > 1024 {
+	if len(line) > 1024 || truncated {
 		errorLog.Printf("WARNING: Unusually long line in stdout (%d bytes, line #%d). First 100 chars: %s...", 
 			len(line), lineCount, truncateString(line, 100))
 	}
@@ -324,7 +385,7 @@ func (br *BackupRunner) processOutputLine(line string, filesSeen *int, lineCount
 	// Parse for FILE_SAVED lines (they might be in stdout)
 	filePath, domain := br.parseSavedFileLine(line)
 	if filePath != "" {
-		*filesSeen++
+		*filesSeen += 1
 		if br.verbose {
 			infoLog.Printf("DEBUG: Detected FILE_SAVED #%d in stdout: %s (domain: %s)", *filesSeen, filepath.Base(filePath), domain)
 		}
@@ -368,28 +429,23 @@ func (br *BackupRunner) processStderr(pipe io.Reader) error {
 	reader := bufio.NewReader(pipe)
 	filesSeen := 0
 	lineCount := 0
-	
+
 	for {
-		line, err := reader.ReadString('\n')
+		line, err, truncated := readOutputLine(reader)
 		if err != nil {
 			if err == io.EOF {
-				// Process final line if it doesn't end with newline
 				if len(line) > 0 {
 					lineCount++
-					br.processStderrLine(line, &filesSeen, lineCount)
+					br.processStderrLine(line, &filesSeen, lineCount, truncated)
 				}
 				break
 			}
 			errorLog.Printf("Error reading stderr: %v", err)
 			return fmt.Errorf("read error on stderr: %v", err)
 		}
-		
+
 		lineCount++
-		// Remove trailing newline
-		line = strings.TrimSuffix(line, "\n")
-		line = strings.TrimSuffix(line, "\r") // Handle Windows line endings
-		
-		br.processStderrLine(line, &filesSeen, lineCount)
+		br.processStderrLine(line, &filesSeen, lineCount, truncated)
 	}
 
 	if br.verbose {
@@ -404,9 +460,9 @@ func (br *BackupRunner) processStderr(pipe io.Reader) error {
 }
 
 // processStderrLine handles a single line of stderr output
-func (br *BackupRunner) processStderrLine(line string, filesSeen *int, lineCount int) {
+func (br *BackupRunner) processStderrLine(line string, filesSeen *int, lineCount int, truncated bool) {
 	// Log unusually long lines to diagnose buffer issues
-	if len(line) > 1024 {
+	if len(line) > 1024 || truncated {
 		errorLog.Printf("WARNING: Unusually long line in stderr (%d bytes, line #%d). First 100 chars: %s...", 
 			len(line), lineCount, truncateString(line, 100))
 	}
@@ -434,7 +490,7 @@ func (br *BackupRunner) processStderrLine(line string, filesSeen *int, lineCount
 	// Parse for FILE_SAVED lines
 	filePath, domain := br.parseSavedFileLine(line)
 	if filePath != "" {
-		*filesSeen++
+		*filesSeen += 1
 		if br.verbose {
 			infoLog.Printf("DEBUG: Detected FILE_SAVED #%d: %s (domain: %s)", *filesSeen, filepath.Base(filePath), domain)
 		}
@@ -455,7 +511,25 @@ func (br *BackupRunner) processStderrLine(line string, filesSeen *int, lineCount
 // Stop stops the backup runner gracefully
 func (br *BackupRunner) Stop() {
 	infoLog.Println("Shutdown requested, waiting for all files to be processed...")
-	
+	br.stopOnce.Do(func() {
+		br.cmdMu.Lock()
+		cancel := br.ctxCancel
+		cmd := br.cmd
+		br.cmdMu.Unlock()
+
+		if cancel != nil {
+			cancel()
+		}
+
+		if cmd != nil && cmd.Process != nil {
+			_ = cmd.Process.Signal(os.Interrupt)
+			go func(p *os.Process) {
+				time.Sleep(5 * time.Second)
+				_ = p.Kill()
+			}(cmd.Process)
+		}
+	})
+
 	// Wait for output processors to finish
 	br.wg.Wait()
 	
