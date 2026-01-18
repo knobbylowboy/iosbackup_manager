@@ -18,7 +18,7 @@ import (
 )
 
 var (
-	executableDir string
+	executableDir     string
 	executableDirOnce sync.Once
 )
 
@@ -35,7 +35,7 @@ func getExecutableDir() string {
 			executableDir = "."
 			return
 		}
-		
+
 		// If running as a test binary, use current working directory
 		// Test binaries are typically in temp directories
 		if strings.Contains(filepath.Base(execPath), "test") {
@@ -46,7 +46,7 @@ func getExecutableDir() string {
 				return
 			}
 		}
-		
+
 		executableDir = filepath.Dir(execPath)
 	})
 	return executableDir
@@ -55,13 +55,13 @@ func getExecutableDir() string {
 // findExecutable looks for an executable in libraries folder, project root, then PATH
 func findExecutable(name string) (string, bool) {
 	execDir := getExecutableDir()
-	
+
 	// Priority 1: Try in libraries subdirectory
 	librariesPath := filepath.Join(execDir, "libraries", name)
 	if info, err := os.Stat(librariesPath); err == nil && !info.IsDir() {
 		return librariesPath, true
 	}
-	
+
 	// Also try with .exe extension on Windows
 	if filepath.Ext(name) == "" {
 		librariesPathExe := librariesPath + ".exe"
@@ -69,13 +69,13 @@ func findExecutable(name string) (string, bool) {
 			return librariesPathExe, true
 		}
 	}
-	
+
 	// Priority 2: Try in the executable directory (project root)
 	localPath := filepath.Join(execDir, name)
 	if info, err := os.Stat(localPath); err == nil && !info.IsDir() {
 		return localPath, true
 	}
-	
+
 	// Also try with .exe extension on Windows
 	if filepath.Ext(name) == "" {
 		localPathExe := localPath + ".exe"
@@ -83,7 +83,7 @@ func findExecutable(name string) (string, bool) {
 			return localPathExe, true
 		}
 	}
-	
+
 	// Priority 3: Try current working directory (useful for tests)
 	wd, err := os.Getwd()
 	if err == nil && wd != execDir {
@@ -99,20 +99,19 @@ func findExecutable(name string) (string, bool) {
 			}
 		}
 	}
-	
+
 	// Priority 4: Fall back to PATH lookup
 	if path, err := exec.LookPath(name); err == nil {
 		return path, true
 	}
-	
+
 	return "", false
 }
 
 // Image resize constants (matching Dart PdfConfig)
 const (
-	standardImageWidth  = 500 // Standard image width for PDF
-	thumbnailImageWidth = 150 // Thumbnail width (not currently used, but available)
-	jpegQuality         = 85  // JPEG quality (matching Dart implementation)
+	standardImageWidth = 500 // Standard image width for PDF
+	jpegQuality        = 85  // JPEG quality (matching Dart implementation)
 )
 
 // resizeImage resizes an image to the specified width while maintaining aspect ratio
@@ -156,20 +155,20 @@ func resizeImage(img image.Image, maxWidth int) (image.Image, error) {
 		}()
 		resized = image.NewRGBA(image.Rect(0, 0, maxWidth, newHeight))
 	}()
-	
+
 	if allocationErr != nil {
 		return nil, allocationErr
 	}
-	
+
 	if resized == nil {
 		return nil, fmt.Errorf("failed to allocate memory for resized image")
 	}
-	
+
 	// Simple nearest-neighbor resize
 	for y := 0; y < newHeight; y++ {
 		for x := 0; x < maxWidth; x++ {
-			srcX := bounds.Min.X + (x * width) / maxWidth
-			srcY := bounds.Min.Y + (y * height) / newHeight
+			srcX := bounds.Min.X + (x*width)/maxWidth
+			srcY := bounds.Min.Y + (y*height)/newHeight
 			resized.Set(x, y, img.At(srcX, srcY))
 		}
 	}
@@ -179,10 +178,10 @@ func resizeImage(img image.Image, maxWidth int) (image.Image, error) {
 
 // FileTiming holds timing information for file processing
 type FileTiming struct {
-	CreatedTime      time.Time // Time the file was created (ModTime)
-	DiscoveredTime   time.Time // Time the file was discovered
+	CreatedTime             time.Time // Time the file was created (ModTime)
+	DiscoveredTime          time.Time // Time the file was discovered
 	TransformationStartTime time.Time // Time transformation started
-	DiscoveryMethod  string    // How the file was discovered: "notify" or "scan"
+	DiscoveryMethod         string    // How the file was discovered: "notify" or "scan"
 }
 
 // BackupTransformer handles conversion of backup files
@@ -191,10 +190,10 @@ type BackupTransformer struct {
 	videoSemaphore chan struct{}
 	heicSemaphore  chan struct{}
 	gifSemaphore   chan struct{}
-	
+
 	// Queue depth tracking (set by BackupRunner)
-	queueDepth func() (active int64, total int64) // Function to get current queue depth
-	incrementTotal func()                        // Function to increment total count when transformation starts
+	queueDepth     func() (active int64, total int64) // Function to get current queue depth
+	incrementTotal func()                             // Function to increment total count when transformation starts
 }
 
 // NewBackupTransformer creates a new backup transformer
@@ -204,7 +203,7 @@ func NewBackupTransformer() *BackupTransformer {
 	videoSem := make(chan struct{}, 5)
 	heicSem := make(chan struct{}, 100)
 	gifSem := make(chan struct{}, 5)
-	
+
 	return &BackupTransformer{
 		videoSemaphore: videoSem,
 		heicSemaphore:  heicSem,
@@ -235,18 +234,18 @@ func (bt *BackupTransformer) ProcessFileByExtension(filePath string, fileExt str
 	// Process based on file extension (case-insensitive)
 	switch fileExt {
 	case ".heic":
-		bt.convertHeicToJpeg(filePath, timing)
+		bt.convertHeicToJpeg(filePath)
 	case ".gif":
-		bt.convertGifToJpeg(filePath, timing)
+		bt.convertGifToJpeg(filePath)
 	case ".jpg", ".jpeg":
-		bt.resizeJpeg(filePath, timing)
+		bt.resizeJpeg(filePath)
 	case ".png":
-		bt.convertPngToJpeg(filePath, timing)
+		bt.convertPngToJpeg(filePath)
 	case ".webp":
-		bt.convertWebpToJpeg(filePath, timing)
+		bt.convertWebpToJpeg(filePath)
 	case ".mp4", ".mov", ".avi", ".mpg", ".mpeg", ".wmv", ".flv", ".webm", ".mkv", ".m4v",
 		".3gp", ".3gpp", ".ts", ".m2ts", ".mts", ".vob", ".asf", ".ogv", ".ogg", ".f4v":
-		bt.convertVideoToJpeg(filePath, timing)
+		bt.convertVideoToJpeg(filePath)
 	default:
 		// Not a media file, skip (ios_backup already filtered what we need)
 	}
@@ -254,8 +253,8 @@ func (bt *BackupTransformer) ProcessFileByExtension(filePath string, fileExt str
 
 // convertHeicToJpeg converts a HEIC file to JPEG, overwriting the original
 // Uses heic-converter external tool
-func (bt *BackupTransformer) convertHeicToJpeg(heicFilePath string, timing *FileTiming) {
-	bt.heicSemaphore <- struct{}{} // Acquire semaphore
+func (bt *BackupTransformer) convertHeicToJpeg(heicFilePath string) {
+	bt.heicSemaphore <- struct{}{}        // Acquire semaphore
 	defer func() { <-bt.heicSemaphore }() // Release semaphore
 
 	// Increment total count when transformation actually starts
@@ -285,7 +284,7 @@ func (bt *BackupTransformer) convertHeicToJpeg(heicFilePath string, timing *File
 	if err := tempJpeg.Close(); err != nil {
 		errorLog.Printf("Warning: error closing temp file: %v", err)
 	}
-	
+
 	// Setup cleanup
 	cleanupTemp := true
 	defer func() {
@@ -307,7 +306,7 @@ func (bt *BackupTransformer) convertHeicToJpeg(heicFilePath string, timing *File
 		if ctx.Err() == context.DeadlineExceeded {
 			errorLog.Printf("HEIC conversion timed out after 30 seconds for %s", heicFilePath)
 		} else if exitErr, ok := err.(*exec.ExitError); ok {
-			errorLog.Printf("HEIC converter crashed or failed for %s: exit code %d, output: %s", 
+			errorLog.Printf("HEIC converter crashed or failed for %s: exit code %d, output: %s",
 				heicFilePath, exitErr.ExitCode(), string(output))
 		} else {
 			errorLog.Printf("HEIC conversion failed for %s: %v, output: %s", heicFilePath, err, string(output))
@@ -339,7 +338,7 @@ func (bt *BackupTransformer) convertHeicToJpeg(heicFilePath string, timing *File
 		errorLog.Printf("Error replacing original HEIC file: %v", err)
 		return
 	}
-	
+
 	// Don't cleanup temp file since we successfully renamed it
 	cleanupTemp = false
 
@@ -349,8 +348,8 @@ func (bt *BackupTransformer) convertHeicToJpeg(heicFilePath string, timing *File
 
 // convertGifToJpeg converts a GIF file to JPEG, overwriting the original
 // Uses Go's standard library for pure Go implementation
-func (bt *BackupTransformer) convertGifToJpeg(gifFilePath string, timing *FileTiming) {
-	bt.gifSemaphore <- struct{}{} // Acquire semaphore
+func (bt *BackupTransformer) convertGifToJpeg(gifFilePath string) {
+	bt.gifSemaphore <- struct{}{}        // Acquire semaphore
 	defer func() { <-bt.gifSemaphore }() // Release semaphore
 
 	// Increment total count when transformation actually starts
@@ -392,7 +391,7 @@ func (bt *BackupTransformer) convertGifToJpeg(gifFilePath string, timing *FileTi
 		return
 	}
 	tempJpegPath := tempJpeg.Name()
-	
+
 	// Setup cleanup
 	cleanupTemp := true
 	defer func() {
@@ -409,7 +408,7 @@ func (bt *BackupTransformer) convertGifToJpeg(gifFilePath string, timing *FileTi
 		errorLog.Printf("Error encoding JPEG: %v", err)
 		return
 	}
-	
+
 	// Close the file before rename
 	if err := tempJpeg.Close(); err != nil {
 		errorLog.Printf("Warning: error closing temp JPEG file: %v", err)
@@ -420,7 +419,7 @@ func (bt *BackupTransformer) convertGifToJpeg(gifFilePath string, timing *FileTi
 		errorLog.Printf("Error replacing original GIF file: %v", err)
 		return
 	}
-	
+
 	// Don't cleanup temp file since we successfully renamed it
 	cleanupTemp = false
 
@@ -429,7 +428,7 @@ func (bt *BackupTransformer) convertGifToJpeg(gifFilePath string, timing *FileTi
 }
 
 // resizeJpeg resizes a JPEG file to the standard width, overwriting the original
-func (bt *BackupTransformer) resizeJpeg(jpegFilePath string, timing *FileTiming) {
+func (bt *BackupTransformer) resizeJpeg(jpegFilePath string) {
 	// Increment total count when transformation actually starts
 	if bt.incrementTotal != nil {
 		bt.incrementTotal()
@@ -461,7 +460,7 @@ func (bt *BackupTransformer) resizeJpeg(jpegFilePath string, timing *FileTiming)
 }
 
 // convertPngToJpeg converts a PNG file to JPEG and resizes it, overwriting the original
-func (bt *BackupTransformer) convertPngToJpeg(pngFilePath string, timing *FileTiming) {
+func (bt *BackupTransformer) convertPngToJpeg(pngFilePath string) {
 	// Increment total count when transformation actually starts
 	if bt.incrementTotal != nil {
 		bt.incrementTotal()
@@ -501,7 +500,7 @@ func (bt *BackupTransformer) convertPngToJpeg(pngFilePath string, timing *FileTi
 		return
 	}
 	tempJpegPath := tempJpeg.Name()
-	
+
 	// Setup cleanup
 	cleanupTemp := true
 	defer func() {
@@ -518,7 +517,7 @@ func (bt *BackupTransformer) convertPngToJpeg(pngFilePath string, timing *FileTi
 		errorLog.Printf("Error encoding JPEG: %v", err)
 		return
 	}
-	
+
 	// Close the file before rename
 	if err := tempJpeg.Close(); err != nil {
 		errorLog.Printf("Warning: error closing temp JPEG file: %v", err)
@@ -529,7 +528,7 @@ func (bt *BackupTransformer) convertPngToJpeg(pngFilePath string, timing *FileTi
 		errorLog.Printf("Error replacing original PNG file: %v", err)
 		return
 	}
-	
+
 	// Don't cleanup temp file since we successfully renamed it
 	cleanupTemp = false
 
@@ -538,7 +537,7 @@ func (bt *BackupTransformer) convertPngToJpeg(pngFilePath string, timing *FileTi
 }
 
 // convertWebpToJpeg converts a WEBP file to JPEG and resizes it, overwriting the original
-func (bt *BackupTransformer) convertWebpToJpeg(webpFilePath string, timing *FileTiming) {
+func (bt *BackupTransformer) convertWebpToJpeg(webpFilePath string) {
 	// Increment total count when transformation actually starts
 	if bt.incrementTotal != nil {
 		bt.incrementTotal()
@@ -578,7 +577,7 @@ func (bt *BackupTransformer) convertWebpToJpeg(webpFilePath string, timing *File
 		return
 	}
 	tempJpegPath := tempJpeg.Name()
-	
+
 	// Setup cleanup
 	cleanupTemp := true
 	defer func() {
@@ -595,7 +594,7 @@ func (bt *BackupTransformer) convertWebpToJpeg(webpFilePath string, timing *File
 		errorLog.Printf("Error encoding JPEG: %v", err)
 		return
 	}
-	
+
 	// Close the file before rename
 	if err := tempJpeg.Close(); err != nil {
 		errorLog.Printf("Warning: error closing temp JPEG file: %v", err)
@@ -606,7 +605,7 @@ func (bt *BackupTransformer) convertWebpToJpeg(webpFilePath string, timing *File
 		errorLog.Printf("Error replacing original WEBP file: %v", err)
 		return
 	}
-	
+
 	// Don't cleanup temp file since we successfully renamed it
 	cleanupTemp = false
 
@@ -616,8 +615,8 @@ func (bt *BackupTransformer) convertWebpToJpeg(webpFilePath string, timing *File
 
 // convertVideoToJpeg generates a JPEG thumbnail from a video, overwriting the original
 // Uses ffmpeg via exec (requires ffmpeg to be available)
-func (bt *BackupTransformer) convertVideoToJpeg(videoFilePath string, timing *FileTiming) {
-	bt.videoSemaphore <- struct{}{} // Acquire semaphore
+func (bt *BackupTransformer) convertVideoToJpeg(videoFilePath string) {
+	bt.videoSemaphore <- struct{}{}        // Acquire semaphore
 	defer func() { <-bt.videoSemaphore }() // Release semaphore
 
 	// Increment total count when transformation actually starts
@@ -657,7 +656,7 @@ func (bt *BackupTransformer) convertVideoToJpeg(videoFilePath string, timing *Fi
 	if err := tempJpeg.Close(); err != nil {
 		errorLog.Printf("Warning: error closing temp file: %v", err)
 	}
-	
+
 	// Setup cleanup
 	cleanupTemp := true
 	defer func() {
@@ -689,7 +688,7 @@ func (bt *BackupTransformer) convertVideoToJpeg(videoFilePath string, timing *Fi
 		if ctx.Err() == context.DeadlineExceeded {
 			errorLog.Printf("Video thumbnail generation timed out after 60 seconds for %s", videoFilePath)
 		} else if exitErr, ok := err.(*exec.ExitError); ok {
-			errorLog.Printf("ffmpeg crashed or failed for %s: exit code %d, output: %s", 
+			errorLog.Printf("ffmpeg crashed or failed for %s: exit code %d, output: %s",
 				videoFilePath, exitErr.ExitCode(), string(output))
 		} else {
 			errorLog.Printf("Video thumbnail generation failed for %s: %v, output: %s", videoFilePath, err, string(output))
@@ -721,7 +720,7 @@ func (bt *BackupTransformer) convertVideoToJpeg(videoFilePath string, timing *Fi
 		errorLog.Printf("Error replacing original video file: %v", err)
 		return
 	}
-	
+
 	// Don't cleanup temp file since we successfully renamed it
 	cleanupTemp = false
 
@@ -892,7 +891,7 @@ func resizeJpegImage(jpegPath string, maxWidth int) (string, error) {
 		}
 		return "", fmt.Errorf("failed to create resized file: %v", err)
 	}
-	
+
 	// Ensure file is closed and handle errors
 	var encodeErr error
 	func() {
@@ -903,7 +902,7 @@ func resizeJpegImage(jpegPath string, maxWidth int) (string, error) {
 		}()
 		encodeErr = jpeg.Encode(resizedFile, resizedImg, &jpeg.Options{Quality: jpegQuality})
 	}()
-	
+
 	if encodeErr != nil {
 		if rmErr := os.Remove(resizedPath); rmErr != nil && !os.IsNotExist(rmErr) {
 			errorLog.Printf("Warning: failed to cleanup temp file: %v", rmErr)
@@ -913,4 +912,3 @@ func resizeJpegImage(jpegPath string, maxWidth int) (string, error) {
 
 	return resizedPath, nil
 }
-

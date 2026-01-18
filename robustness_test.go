@@ -191,11 +191,7 @@ func TestExternalToolTimeout(t *testing.T) {
 	}
 	
 	// This should fail gracefully with timeout or error, not crash
-	transformer.convertVideoToJpeg(fakeVideo, &FileTiming{
-		CreatedTime:     time.Now(),
-		DiscoveredTime:  time.Now(),
-		DiscoveryMethod: "test",
-	})
+	transformer.convertVideoToJpeg(fakeVideo)
 	
 	// If we get here, no crash occurred
 }
@@ -400,12 +396,7 @@ func TestLoggerInitialization(t *testing.T) {
 
 // TestFileTimingStructure tests FileTiming struct
 func TestFileTimingStructure(t *testing.T) {
-	timing := &FileTiming{
-		CreatedTime:              time.Now(),
-		DiscoveredTime:           time.Now(),
-		TransformationStartTime:  time.Now(),
-		DiscoveryMethod:          "test",
-	}
+	timing := &FileTiming{DiscoveryMethod: "test"}
 	
 	if timing.DiscoveryMethod != "test" {
 		t.Errorf("Expected 'test', got %s", timing.DiscoveryMethod)
